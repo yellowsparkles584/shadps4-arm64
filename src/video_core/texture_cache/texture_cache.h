@@ -130,6 +130,10 @@ public:
     [[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                               ImageId cache_img_id);
 
+    /// Recreates a backing whose dimension cannot support the requested view.
+    [[nodiscard]] ImageId ResolveDimensionOverlap(const ImageInfo& requested_info,
+                                                  ImageId cache_img_id);
+
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
@@ -169,19 +173,9 @@ public:
         return {};
     }
 
-    enum class MetaType {
-        CMask,
-        FMask,
-        HTile,
-    };
-
-    /// Returns meta type if the specified address is a metadata surface.
-    std::optional<MetaType> IsMeta(VAddr address) const {
-        auto it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            return it->second.type;
-        }
-        return std::nullopt;
+    /// Returns true if the specified address is a metadata surface.
+    bool IsMeta(VAddr address) const {
+        return surface_metas.contains(address);
     }
 
     /// Returns true if a slice of the specified metadata surface has been cleared.
@@ -278,8 +272,11 @@ private:
         }
     }
 
+    /// Gets or creates a null image for a particular format.
+    ImageId GetNullImage(vk::Format format);
+
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    void DownloadImageMemory(ImageId image_id);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -317,9 +314,6 @@ private:
         DeleteImage(image_id);
     }
 
-    void GarbageCollectImages();
-    void GarbageCollectSamplers();
-
 private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -331,25 +325,24 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
+    tsl::robin_map<vk::Format, ImageId> null_images;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
-    u64 total_used_samplers = 0;
-    u64 trigger_gc_samplers = 0;
-    u64 pressure_gc_samplers = 0;
-    u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
-    Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
-    std::mutex samplers_mutex;
-    std::mutex download_images_mutex;
     struct MetaDataInfo {
-        MetaType type;
+        enum class Type {
+            CMask,
+            FMask,
+            HTile,
+        };
+        Type type;
         s32 clear_mask = -1;
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;

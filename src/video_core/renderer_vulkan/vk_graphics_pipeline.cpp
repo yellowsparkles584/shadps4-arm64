@@ -6,7 +6,6 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
-#include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -229,19 +228,6 @@ GraphicsPipeline::GraphicsPipeline(
             .module = modules[stage],
             .pName = "main",
         });
-    } else if (runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.clip_distance_emulation) {
-        if (!preloading) {
-            const auto vs_runtime_info =
-                runtime_infos[static_cast<u32>(Shader::LogicalStage::Vertex)].vs_info;
-
-            sdata.fragment =
-                Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs_runtime_info.outputs);
-        }
-        shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
-            .stage = vk::ShaderStageFlagBits::eFragment,
-            .module = CompileSPV(sdata.fragment, instance.GetDevice()),
-            .pName = "main",
-        });
     }
 
     const auto depth_format =
@@ -419,16 +405,22 @@ void GraphicsPipeline::GetVertexInputs(
             .inputRate = step_rate == InstanceIdType::None ? vk::VertexInputRate::eVertex
                                                            : vk::VertexInputRate::eInstance,
         });
-        const u32 divisor = step_rate == InstanceIdType::OverStepRate0
-                                ? step_rate_0
-                                : (step_rate == InstanceIdType::OverStepRate1 ? step_rate_1 : 1);
-        if constexpr (std::is_same_v<Binding, vk::VertexInputBindingDescription2EXT>) {
-            bindings.back().divisor = divisor;
-        } else if (step_rate != InstanceIdType::None) {
-            divisors.push_back(vk::VertexInputBindingDivisorDescriptionEXT{
-                .binding = attrib.semantic,
-                .divisor = divisor,
-            });
+        // When VK_EXT_vertex_attribute_divisor is unsupported (e.g. Mali/Immortalis),
+        // leave the default divisor=1 (per-vertex); instanced attributes degrade but the
+        // binding/guest buffer are still recorded below.
+        if (instance.IsVertexAttributeDivisorSupported()) {
+            const u32 divisor =
+                step_rate == InstanceIdType::OverStepRate0
+                    ? step_rate_0
+                    : (step_rate == InstanceIdType::OverStepRate1 ? step_rate_1 : 1);
+            if constexpr (std::is_same_v<Binding, vk::VertexInputBindingDescription2EXT>) {
+                bindings.back().divisor = divisor;
+            } else if (step_rate != InstanceIdType::None) {
+                divisors.push_back(vk::VertexInputBindingDivisorDescriptionEXT{
+                    .binding = attrib.semantic,
+                    .divisor = divisor,
+                });
+            }
         }
         guest_buffers.emplace_back(buffer);
     }
@@ -461,7 +453,8 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
                            : buffer.GetSharp(*stage); // See for the comment in compute PL creation
             bindings.push_back({
                 .binding = binding++,
-                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
+                                                          : vk::DescriptorType::eUniformBuffer,
                 .descriptorCount = 1,
                 .stageFlags = stage_bit,
             });

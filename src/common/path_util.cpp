@@ -7,7 +7,6 @@
 #include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "common/types.h"
-#include "core/file_sys/ifile.h"
 
 #ifdef __APPLE__
 #include <CoreFoundation/CFBundle.h>
@@ -92,15 +91,22 @@ static auto UserPaths = [] {
         // If it doesn't exist, use the standard path for the platform instead.
         // NOTE: On Windows we currently just create the portable directory instead.
 #ifdef __APPLE__
-        user_dir =
-            std::filesystem::path(getenv("HOME")) / "Library" / "Application Support" / "shadPS4";
+        const char* home = getenv("HOME");
+        if (home != nullptr && home[0] != '\0') {
+            user_dir =
+                std::filesystem::path(home) / "Library" / "Application Support" / "shadPS4";
+        }
 #elif defined(__linux__)
         const char* xdg_data_home = getenv("XDG_DATA_HOME");
+        const char* home = getenv("HOME");
         if (xdg_data_home != nullptr && strlen(xdg_data_home) > 0) {
             user_dir = std::filesystem::path(xdg_data_home) / "shadPS4";
-        } else {
-            user_dir = std::filesystem::path(getenv("HOME")) / ".local" / "share" / "shadPS4";
+        } else if (home != nullptr && home[0] != '\0') {
+            user_dir = std::filesystem::path(home) / ".local" / "share" / "shadPS4";
         }
+        // Neither XDG_DATA_HOME nor HOME is set (e.g. an Android app process): keep the
+        // portable user_dir candidate. Constructing a path from a null pointer here used
+        // to crash the library at static-init time, which killed the whole app on dlopen.
 #elif _WIN32
         TCHAR appdata[MAX_PATH] = {0};
         SHGetFolderPath(NULL, CSIDL_APPDATA, NULL, 0, appdata);
@@ -111,7 +117,11 @@ static auto UserPaths = [] {
     std::unordered_map<PathType, fs::path> paths;
 
     const auto create_path = [&](PathType shad_path, const fs::path& new_path) {
-        std::filesystem::create_directory(new_path);
+        // Non-throwing: when the base directory is unavailable or unwritable (e.g. an
+        // Android app process without HOME), static init must still succeed so the library
+        // loads; callers that need a real directory check existence themselves.
+        std::error_code ec;
+        std::filesystem::create_directory(new_path, ec);
         paths.insert_or_assign(shad_path, new_path);
     };
 
@@ -131,7 +141,6 @@ static auto UserPaths = [] {
     create_path(PathType::CustomConfigs, user_dir / CUSTOM_CONFIGS);
     create_path(PathType::CacheDir, user_dir / CACHE_DIR);
     create_path(PathType::FontsDir, user_dir / FONTS_DIR);
-    create_path(PathType::TrophyDir, user_dir / TROPHY_DIR);
     create_path(PathType::HomeDir, user_dir / HOME_DIR);
     create_path(PathType::CustomModulesDir, user_dir / CUSTOM_MODULES_DIR);
 
@@ -203,43 +212,18 @@ std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& gam
         return std::nullopt;
     }
 
-    const auto boot_path_for = [](const fs::path& root) -> std::optional<fs::path> {
-        std::error_code ec;
-        if (fs::is_directory(root, ec) && !ec) {
-            if (!fs::exists(root / "sce_sys" / "param.sfo")) {
-                return std::nullopt;
-            }
-            if (auto eboot_path = root / "eboot.bin"; fs::exists(eboot_path)) {
-                return eboot_path;
-            }
-            return std::nullopt;
-        }
-        if (Core::FileSys::IsZArchiveFile(root) &&
-            Core::FileSys::ReadGameFile(root, "sce_sys/param.sfo").has_value()) {
-            return root;
-        }
-        return std::nullopt;
-    };
-
     // Check if this is the game we're looking for
-    if (dir.filename() == game_id) {
-        if (auto found = boot_path_for(dir)) {
-            return found;
+    if (dir.filename() == game_id && fs::exists(dir / "sce_sys" / "param.sfo")) {
+        auto eboot_path = dir / "eboot.bin";
+        if (fs::exists(eboot_path)) {
+            return eboot_path;
         }
-    }
-
-    if (auto found = boot_path_for(dir / game_id)) {
-        return found;
-    }
-    if (auto found = boot_path_for(dir / (game_id + ".zar"))) {
-        return found;
     }
 
     // Recursively search subdirectories
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(dir, ec)) {
-        std::error_code entry_ec;
-        if (!entry.is_directory(entry_ec) || entry_ec) {
+        if (!entry.is_directory()) {
             continue;
         }
         if (auto found = FindGameByID(entry.path(), game_id, max_depth - 1)) {

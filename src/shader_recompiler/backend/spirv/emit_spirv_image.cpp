@@ -180,8 +180,14 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
                         : ctx.OpImageQuerySize(type, image);
     }};
     switch (texture.view_type) {
-    case AmdGpu::ImageType::Color1D:
+    case AmdGpu::ImageType::Color1D: {
+        if (texture.is_1d_hosted_as_2d) {
+            const Id host_dimensions = query(ctx.U32[2]);
+            const Id width = ctx.OpCompositeExtract(ctx.U32[1], host_dimensions, 0);
+            return ctx.OpCompositeConstruct(ctx.U32[4], width, zero, zero, mips());
+        }
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[1]), zero, zero, mips());
+    }
     case AmdGpu::ImageType::Color1DArray:
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
@@ -222,22 +228,15 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id color_type = texture.data_types->Get(4);
     ImageOperands operands;
+    operands.Add(spv::ImageOperandsMask::Sample, ms);
     Id texel;
     if (!texture.is_storage) {
         const Id image = ctx.OpLoad(texture.image_type, texture.id);
-        if (texture.view_type == AmdGpu::ImageType::Color2DMsaa) {
-            // GCN hardware wraps out-of-range MSAA sample indices
-            if (Sirit::ValidId(ms)) {
-                const Id sample_count = ctx.OpImageQuerySamples(ctx.U32[1], image);
-                const Id wrapped_ms = ctx.OpUMod(ctx.U32[1], ms, sample_count);
-                operands.Add(spv::ImageOperandsMask::Sample, wrapped_ms);
-            }
-        } else {
+        if (texture.view_type != AmdGpu::ImageType::Color2DMsaa) {
             if (Sirit::ValidId(ms)) {
                 LOG_ERROR(Render_Recompiler, "image is not MS but ms operand is provided");
             }
             operands.Add(spv::ImageOperandsMask::Lod, lod);
-            operands.Add(spv::ImageOperandsMask::Sample, ms);
         }
         texel = ctx.OpImageFetch(color_type, image, coords, operands.mask, operands.operands);
     } else {
@@ -246,7 +245,7 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
             operands.Add(spv::ImageOperandsMask::Lod, lod);
         } else if (Sirit::ValidId(lod)) {
 #if 1
-            // It's confusing what interactions will cause this code path so leave it as
+            // It's  confusing what interactions will cause this code path so leave it as
             // unreachable until a case is found.
             // Normally IMAGE_LOAD_MIP should translate -> OpImageFetch
             UNREACHABLE_MSG("Unsupported ImageRead with Lod");

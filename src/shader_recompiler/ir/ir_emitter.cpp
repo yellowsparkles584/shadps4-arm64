@@ -171,20 +171,8 @@ void IREmitter::SetVectorReg(IR::VectorReg reg, const U32F32& value) {
     Inst(Opcode::SetVectorRegister, reg, value_typed);
 }
 
-Value IREmitter::GetVirtualReg(IR::VirtualReg reg) {
-    return Inst(Opcode::GetVirtualRegister, reg);
-}
-
-void IREmitter::SetVirtualReg(IR::VirtualReg reg, const Value& value) {
-    Inst(Opcode::SetVirtualRegister, reg, value);
-}
-
 U1 IREmitter::GetGotoVariable(u32 id) {
     return Inst<U1>(Opcode::GetGotoVariable, id);
-}
-
-U1 IREmitter::GetMaskLaneVariable(IR::VectorReg vgpr, u32 lane) {
-    return Inst<U1>(Opcode::GetMaskLaneVariable, vgpr, Imm32(lane));
 }
 
 U1 IREmitter::Condition(IR::Condition cond) {
@@ -212,10 +200,6 @@ U1 IREmitter::Condition(IR::Condition cond) {
 
 void IREmitter::SetGotoVariable(u32 id, const U1& value) {
     Inst(Opcode::SetGotoVariable, id, value);
-}
-
-void IREmitter::SetMaskLaneVariable(IR::VectorReg vgpr, u32 lane, const U1& value) {
-    Inst(Opcode::SetMaskLaneVariable, vgpr, Imm32(lane), value);
 }
 
 U1 IREmitter::GetScc() {
@@ -388,12 +372,13 @@ U32U64 IREmitter::SharedAtomicAnd(const U32& address, const U32U64& data, bool i
 U32U64 IREmitter::SharedAtomicOr(const U32& address, const U32U64& data, bool is_gds) {
     switch (data.Type()) {
     case Type::U32:
-        return Inst<U32>(Opcode::SharedAtomicOr32, Flags{is_gds}, address, data);
+        return Inst<U32>(Opcode::SharedAtomicAnd32, Flags{is_gds}, address, data);
     case Type::U64:
-        return Inst<U64>(Opcode::SharedAtomicOr64, Flags{is_gds}, address, data);
+        return Inst<U64>(Opcode::SharedAtomicAnd64, Flags{is_gds}, address, data);
     default:
         ThrowInvalidType(data.Type());
     }
+    return Inst<U32>(Opcode::SharedAtomicOr32, address, data);
 }
 
 U32U64 IREmitter::SharedAtomicXor(const U32& address, const U32U64& data, bool is_gds) {

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+#include "shader_recompiler/backend/spirv/fma_split_diag.h"
+#include "shader_recompiler/backend/spirv/recip_refine_fix.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -32,6 +34,16 @@ Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
+    if (ShouldSplitFmaNoContraction(ctx.info.pgm_hash, ctx.info.stage)) {
+        const Id mul{ctx.OpFMul(ctx.F32[1], a, b)};
+        ctx.Decorate(mul, spv::Decoration::NoContraction);
+        const Id add{ctx.OpFAdd(ctx.F32[1], mul, c)};
+        ctx.Decorate(add, spv::Decoration::NoContraction);
+        ++ctx.fma_split_replaced;
+        ++ctx.fma_split_mul_emitted;
+        ++ctx.fma_split_add_emitted;
+        return add;
+    }
     return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
 }
 
@@ -126,7 +138,21 @@ Id EmitFPLog2(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPRecip32(EmitContext& ctx, Id value) {
-    return ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), value);
+    const Id raw = ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), value);
+    if (!ShouldRefineRecip32(ctx.info.pgm_hash, ctx.info.stage)) {
+        return raw;
+    }
+    // One Newton step pins the reciprocal inside GCN v_rcp_f32's <= 1 ulp
+    // envelope regardless of how coarsely the driver approximates OpFDiv.
+    // Special inputs (±0, ±Inf, NaN, denormal overflow) make the refinement
+    // non-finite; those fall back to the raw division result, which already
+    // matches GCN special semantics.
+    const Id x_r = ctx.OpFMul(ctx.F32[1], value, raw);
+    const Id corr = ctx.OpFSub(ctx.F32[1], ctx.ConstF32(2.0f), x_r);
+    const Id refined = ctx.OpFMul(ctx.F32[1], raw, corr);
+    const Id bad = ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], refined),
+                                   ctx.OpIsInf(ctx.U1[1], refined));
+    return ctx.OpSelect(ctx.F32[1], bad, raw, refined);
 }
 
 Id EmitFPRecip64(EmitContext& ctx, Id value) {

@@ -165,6 +165,11 @@ public:
         return vertex_input_dynamic_state;
     }
 
+    /// Returns true when the nullDescriptor feature of VK_EXT_robustness2 is supported.
+    bool IsNullDescriptorSupported() const {
+        return robustness2 && robustness2_features.nullDescriptor;
+    }
+
     /// Returns true when VK_KHR_fragment_shader_barycentric is supported.
     bool IsFragmentShaderBarycentricSupported() const {
         return fragment_shader_barycentric;
@@ -183,6 +188,11 @@ public:
     /// Returns true when VK_EXT_primitive_topology_list_restart is supported for patch lists.
     bool IsPatchListRestartSupported() const {
         return list_restart && list_restart_features.primitiveTopologyPatchListRestart;
+    }
+
+    /// Returns true when VK_EXT_legacy_vertex_attributes is supported.
+    bool IsLegacyVertexAttributesSupported() const {
+        return legacy_vertex_attributes;
     }
 
     /// Returns true when VK_EXT_provoking_vertex is supported.
@@ -315,6 +325,11 @@ public:
         return properties.limits.minUniformBufferOffsetAlignment;
     }
 
+    ///  Returns the maximum size of uniform buffers.
+    vk::DeviceSize UniformMaxSize() const {
+        return properties.limits.maxUniformBufferRange;
+    }
+
     /// Returns the minimum required alignment for storage buffers
     vk::DeviceSize StorageMinAlignment() const {
         return properties.limits.minStorageBufferOffsetAlignment;
@@ -350,6 +365,20 @@ public:
         return push_descriptor_props.maxPushDescriptors;
     }
 
+    /// Returns true if VK_KHR_push_descriptor is supported. When false, the renderer
+    /// falls back to ordinary descriptor sets on all code paths. Mali/Immortalis drivers
+    /// do not expose this extension, so it must be optional (Bachata-S4 local fix).
+    bool IsPushDescriptorSupported() const {
+        return push_descriptor;
+    }
+
+    /// Returns true if VK_EXT_vertex_attribute_divisor is supported. When false, instanced
+    /// (step-rate) vertex fetch degrades to per-vertex (divisor=1). Per-vertex attributes
+    /// are unaffected. Mali/Immortalis drivers do not expose this extension.
+    bool IsVertexAttributeDivisorSupported() const {
+        return vertex_attribute_divisor;
+    }
+
     /// Returns the vulkan 1.2 physical device properties.
     const vk::PhysicalDeviceVulkan12Properties& GetVk12Properties() const noexcept {
         return vk12_props;
@@ -363,6 +392,23 @@ public:
     /// Returns true if shaders can declare the ClipDistance attribute
     bool IsShaderClipDistanceSupported() const {
         return features.shaderClipDistance;
+    }
+
+    /// Returns true if shaders can declare the CullDistance attribute
+    bool IsShaderCullDistanceSupported() const {
+        return features.shaderCullDistance;
+    }
+
+    u32 GetMaxClipDistances() const {
+        return properties.limits.maxClipDistances;
+    }
+
+    u32 GetMaxCullDistances() const {
+        return properties.limits.maxCullDistances;
+    }
+
+    u32 GetMaxCombinedClipAndCullDistances() const {
+        return properties.limits.maxCombinedClipAndCullDistances;
     }
 
     /// Returns the maximim viewport width.
@@ -383,17 +429,6 @@ public:
     /// Returns the maximum render area height.
     u32 GetMaxFramebufferHeight() const {
         return properties.limits.maxFramebufferHeight;
-    }
-
-    /// Returns the maximum number of samplers that can be allocated at once.
-    u32 GetMaxSamplerAllocationCount() const {
-        if (driver_id == vk::DriverId::eMesaKosmickrisp) {
-            // FIXME: KosmicKrisp has an internal 1024 unique sampler limit before
-            // vkCreateSampler starts returning VK_ERROR_OUT_OF_HOST_MEMORY. Work
-            // around this for now by reducing the value to 1024.
-            return 1024;
-        }
-        return properties.limits.maxSamplerAllocationCount;
     }
 
     /// Returns the sample count flags supported by color buffers.
@@ -422,11 +457,6 @@ public:
     bool Is2dViewOf3dSupported() const {
         return image_2d_view_of_3d && image_2d_view_of_3d_features.image2DViewOf3D &&
                image_2d_view_of_3d_features.sampler2DViewOf3D;
-    }
-
-    /// Returns whether VK_EXT_image_view_min_lod is supported.
-    bool IsImageViewMinLodSupported() const {
-        return image_view_min_lod;
     }
 
     /// Returns whether the device can report memory usage.
@@ -475,6 +505,7 @@ private:
     vk::PhysicalDeviceVulkan12Features vk12_features;
     vk::PhysicalDeviceVulkan13Features vk13_features;
     vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic_state_3_features;
+    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2_features;
     vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT shader_atomic_float2_features;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR
         workgroup_memory_explicit_layout_features;
@@ -499,7 +530,9 @@ private:
     bool dynamic_state_3{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
+    bool robustness2{};
     bool list_restart{};
+    bool legacy_vertex_attributes{};
     bool provoking_vertex{};
     bool shader_stencil_export{};
     bool image_load_store_lod{};
@@ -507,13 +540,14 @@ private:
     bool amd_shader_trinary_minmax{};
     bool nv_framebuffer_mixed_samples{};
     bool amd_mixed_attachment_samples{};
+    bool push_descriptor{};
+    bool vertex_attribute_divisor{};
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
     bool maintenance_8{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
-    bool image_view_min_lod{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

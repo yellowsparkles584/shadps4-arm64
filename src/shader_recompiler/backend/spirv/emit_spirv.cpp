@@ -9,8 +9,10 @@
 
 #include "common/assert.h"
 #include "common/func_traits.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+#include "shader_recompiler/backend/spirv/fma_split_diag.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -256,8 +258,8 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     ctx.AddCapability(spv::Capability::Int8);
     ctx.AddCapability(spv::Capability::Int16);
     ctx.AddCapability(spv::Capability::Int64);
-    ctx.AddCapability(spv::Capability::StorageBuffer8BitAccess);
-    ctx.AddCapability(spv::Capability::StorageBuffer16BitAccess);
+    ctx.AddCapability(spv::Capability::UniformAndStorageBuffer8BitAccess);
+    ctx.AddCapability(spv::Capability::UniformAndStorageBuffer16BitAccess);
     if (info.uses_fp16) {
         ctx.AddCapability(spv::Capability::Float16);
     }
@@ -307,14 +309,10 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         } else if (profile.supports_fragment_shader_barycentric) {
             ctx.AddExtension("SPV_KHR_fragment_shader_barycentric");
             ctx.AddCapability(spv::Capability::FragmentBarycentricKHR);
-            ctx.AddCapability(spv::Capability::InterpolationFunction);
         }
         if (info.loads.Get(IR::Attribute::SampleIndex) ||
             runtime_info.fs_info.addr_flags.linear_sample_ena ||
-            runtime_info.fs_info.addr_flags.persp_sample_ena ||
-            (!profile.supports_amd_shader_explicit_vertex_parameter &&
-             profile.supports_fragment_shader_barycentric &&
-             info.loads.Get(IR::Attribute::BaryCoordSmoothSample))) {
+            runtime_info.fs_info.addr_flags.persp_sample_ena) {
             ctx.AddCapability(spv::Capability::SampleRateShading);
         }
         if (info.loads.GetAny(IR::Attribute::RenderTargetIndex)) {
@@ -339,6 +337,12 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     } else if (stage == LogicalStage::Geometry &&
                info.stores.GetAny(IR::Attribute::ViewportIndex)) {
         ctx.AddCapability(spv::Capability::MultiViewport);
+    }
+    if (Sirit::ValidId(ctx.clip_distances)) {
+        ctx.AddCapability(spv::Capability::ClipDistance);
+    }
+    if (Sirit::ValidId(ctx.cull_distances)) {
+        ctx.AddCapability(spv::Capability::CullDistance);
     }
     if (info.uses_dma) {
         ctx.AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
@@ -421,6 +425,9 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         break;
     default:
         UNREACHABLE_MSG("Stage {}", u32(info.stage));
+    }
+    if (ShouldSplitFmaNoContraction(info.pgm_hash, info.stage)) {
+        ctx.AddExecutionMode(main, spv::ExecutionMode::ContractionOff);
     }
     ctx.AddEntryPoint(execution_model, main, "main", interfaces);
 }
@@ -642,7 +649,26 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     SetupFloatMode(ctx, profile, runtime_info, main);
     PatchPhiNodes(program, ctx);
     binding.user_data += program.info.ud_mask.NumRegs();
-    return ctx.Assemble();
+    auto spv = ctx.Assemble();
+    if (ShouldSplitFmaNoContraction(program.info.pgm_hash, program.info.stage)) {
+        const auto scan = ScanSpirvFmaOps(spv);
+        const bool survived = SplitFmaSurvivedBackend(scan) && scan.contraction_off > 0 &&
+                              ctx.fma_split_replaced == ctx.fma_split_mul_emitted &&
+                              ctx.fma_split_replaced == ctx.fma_split_add_emitted;
+        LOG_WARNING(Render_Recompiler, "A830_FMA_SPLIT enabled=1");
+        LOG_WARNING(Render_Recompiler, "shader={:#x}", program.info.pgm_hash);
+        LOG_WARNING(Render_Recompiler, "FPFma replaced={}", ctx.fma_split_replaced);
+        LOG_WARNING(Render_Recompiler, "mul emitted={}", ctx.fma_split_mul_emitted);
+        LOG_WARNING(Render_Recompiler, "add emitted={}", ctx.fma_split_add_emitted);
+        LOG_WARNING(Render_Recompiler, "no_contraction={}", survived ? "YES" : "NO");
+        LOG_WARNING(Render_Recompiler,
+                    "A830_FMA_SPLIT spirv shader={:#x} OpFMul={} OpFAdd={} GLSLstd450Fma={} "
+                    "OpFmaKHR={} NoContraction={} ContractionOff={} survived={}",
+                    program.info.pgm_hash, scan.op_fmul, scan.op_fadd, scan.glsl_fma,
+                    scan.op_fma_khr, scan.no_contraction, scan.contraction_off,
+                    survived ? "YES" : "NO");
+    }
+    return spv;
 }
 
 Id EmitPhi(EmitContext& ctx, IR::Inst* inst) {

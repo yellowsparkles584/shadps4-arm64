@@ -3,9 +3,16 @@
 
 #include <xxhash.h>
 
+#include <mutex>
+#include <string>
+#include <unordered_set>
+
+#include <magic_enum/magic_enum.hpp>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/logging/log.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -13,7 +20,9 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/staging_diag.h"
 #include "video_core/texture_cache/host_compatibility.h"
+#include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -21,6 +30,68 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+static constexpr std::size_t MaxViewDimensionMismatchRecords = 64;
+
+static void LogViewDimensionMismatch(const TextureCache::ImageDesc& desc, const Image& image) {
+    if (IsViewTypeCompatible(desc.view_info.type, image.info.type)) {
+        return;
+    }
+
+    const auto& requested = desc.info;
+    const auto& backing = image.info;
+    const auto requested_micro = AmdGpu::GetMicroTileMode(requested.tile_mode);
+    const auto backing_micro = AmdGpu::GetMicroTileMode(backing.tile_mode);
+    const u32 active_backing_samples = image.backing ? image.backing->num_samples : 0;
+    const std::string actual_vk_type =
+        image.backing ? vk::to_string(image.backing->image.image_ci.imageType) : "None";
+    const std::string actual_vk_format =
+        image.backing ? vk::to_string(image.backing->image.image_ci.format) : "None";
+    const std::string actual_vk_samples =
+        image.backing ? vk::to_string(image.backing->image.image_ci.samples) : "None";
+    const std::string record = fmt::format(
+        "VIEW_DIMENSION_MISMATCH binding={} view={} requested_type={} backing_type={} "
+        "request_addr={:#x} request_size={:#x} backing_addr={:#x} backing_size={:#x} "
+        "request_extent={}x{}x{} request_pitch={} request_bpp={} request_samples={} "
+        "request_levels={} request_layers={} request_tile={} request_array={} "
+        "request_micro={} request_thickness={} request_format={} "
+        "backing_extent={}x{}x{} backing_pitch={} backing_bpp={} backing_samples={} "
+        "active_backing_samples={} actual_vk_type={} actual_vk_format={} actual_vk_samples={} "
+        "backing_levels={} backing_layers={} backing_tile={} "
+        "backing_array={} backing_micro={} backing_thickness={} backing_format={} "
+        "view_format={} mip_base={} mip_count={} layer_base={} layer_count={} storage={} "
+        "history_texture={} history_storage={} history_rt={} history_depth={} history_vo={} "
+        "bound={} target={} usage_flags={}",
+        magic_enum::enum_name(desc.type), magic_enum::enum_name(desc.view_info.type),
+        magic_enum::enum_name(requested.type), magic_enum::enum_name(backing.type),
+        requested.guest_address, requested.guest_size, backing.guest_address, backing.guest_size,
+        requested.size.width, requested.size.height, requested.size.depth, requested.pitch,
+        requested.num_bits, requested.num_samples, requested.resources.levels,
+        requested.resources.layers, magic_enum::enum_name(requested.tile_mode),
+        magic_enum::enum_name(requested.array_mode), magic_enum::enum_name(requested_micro),
+        AmdGpu::GetMicroTileThickness(requested.array_mode),
+        vk::to_string(requested.pixel_format), backing.size.width, backing.size.height,
+        backing.size.depth, backing.pitch, backing.num_bits, backing.num_samples,
+        active_backing_samples, actual_vk_type, actual_vk_format, actual_vk_samples,
+        backing.resources.levels, backing.resources.layers,
+        magic_enum::enum_name(backing.tile_mode), magic_enum::enum_name(backing.array_mode),
+        magic_enum::enum_name(backing_micro), AmdGpu::GetMicroTileThickness(backing.array_mode),
+        vk::to_string(backing.pixel_format), vk::to_string(desc.view_info.format),
+        desc.view_info.range.base.level, desc.view_info.range.extent.levels,
+        desc.view_info.range.base.layer, desc.view_info.range.extent.layers,
+        desc.view_info.is_storage, image.usage.texture, image.usage.storage,
+        image.usage.render_target, image.usage.depth_target, image.usage.vo_surface,
+        image.binding.is_bound, image.binding.is_target, vk::to_string(image.usage_flags));
+
+    static std::mutex records_mutex;
+    static std::unordered_set<std::string> records;
+    {
+        std::scoped_lock lock{records_mutex};
+        if (records.size() >= MaxViewDimensionMismatchRecords || !records.emplace(record).second) {
+            return;
+        }
+    }
+    LOG_ERROR(Render_Vulkan, "{}", record);
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
@@ -29,11 +100,9 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
-
-    u32 max_samplers = instance.GetMaxSamplerAllocationCount();
-    trigger_gc_samplers = max_samplers * 3 / 4;
-    pressure_gc_samplers = max_samplers * 7 / 8;
-    critical_gc_samplers = max_samplers * 15 / 16;
+    // Create basic null image at fixed image ID.
+    const auto null_id = GetNullImage(vk::Format::eR8G8B8A8Unorm);
+    ASSERT(null_id.index == NULL_IMAGE_ID.index);
 
     // Set up garbage collection parameters.
     if (!instance.CanReportMemoryUsage()) {
@@ -60,21 +129,47 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 
 TextureCache::~TextureCache() = default;
 
+ImageId TextureCache::GetNullImage(const vk::Format format) {
+    const auto existing_image = null_images.find(format);
+    if (existing_image != null_images.end()) {
+        return existing_image->second;
+    }
+
+    ImageInfo info{};
+    info.pixel_format = format;
+    info.type = AmdGpu::ImageType::Color2D;
+    info.tile_mode = AmdGpu::TileMode::Thin1DThin;
+    info.num_bits = 32;
+    info.UpdateSize();
+
+    const ImageId null_id =
+        slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
+    auto& image = slot_images[null_id];
+    Vulkan::SetObjectName(instance.GetDevice(), image.GetImage(),
+                          fmt::format("Null Image ({})", vk::to_string(format)));
+
+    image.flags = ImageFlagBits::Empty;
+    image.track_addr = image.info.guest_address;
+    image.track_addr_end = image.info.guest_address + image.info.guest_size;
+
+    null_images.emplace(format, null_id);
+    return null_id;
+}
+
 void TextureCache::ProcessDownloadImages() {
-    std::unique_lock lk{download_images_mutex};
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
+        DownloadImageMemory(image_id);
     }
     download_images.clear();
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+void TextureCache::DownloadImageMemory(ImageId image_id) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
+    const u32 download_size = image.info.pitch * image.info.size.height *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
     const auto [download, offset] = download_buffer.Map(download_size);
@@ -92,7 +187,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                 .layerCount = image.info.resources.layers,
             },
         .imageOffset = {0, 0, 0},
-        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+        .imageExtent = {image.info.size.width, image.info.size.height, 1},
     };
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -100,17 +195,11 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              download_buffer.Handle(), image_download);
 
-    if (sync) {
-        scheduler.Finish();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download, download_size);
-    } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
-            });
-    }
+    scheduler.DeferPriorityOperation(
+        [this, device_addr = image.info.guest_address, download, download_size] {
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
+                                                      download_size);
+        });
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -269,6 +358,65 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     return cache_image_id;
 }
 
+ImageId TextureCache::ResolveDimensionOverlap(const ImageInfo& requested_info,
+                                              ImageId cache_image_id) {
+    auto& cache_image = slot_images[cache_image_id];
+    if (!NeedsViewTypeRecreation(requested_info.type, cache_image.info.type)) {
+        return {};
+    }
+
+    const auto& cached_info = cache_image.info;
+    const bool is_supported_single_row =
+        requested_info.size.width == cached_info.size.width && requested_info.size.height == 1 &&
+        cached_info.size.height == 1 && requested_info.size.depth == 1 &&
+        cached_info.size.depth == 1 && requested_info.resources.levels == 1 &&
+        cached_info.resources.levels == 1 && requested_info.resources.layers == 1 &&
+        cached_info.resources.layers == 1 && requested_info.num_samples == 1 &&
+        cached_info.num_samples == 1 && requested_info.pixel_format == cached_info.pixel_format &&
+        requested_info.tile_mode == cached_info.tile_mode;
+    if (!is_supported_single_row) {
+        LOG_ERROR(Render_Vulkan,
+                  "Unsupported image dimension recreation: requested={} backing={} "
+                  "requested_extent={}x{}x{} backing_extent={}x{}x{}",
+                  magic_enum::enum_name(requested_info.type),
+                  magic_enum::enum_name(cached_info.type), requested_info.size.width,
+                  requested_info.size.height, requested_info.size.depth, cached_info.size.width,
+                  cached_info.size.height, cached_info.size.depth);
+        return {};
+    }
+
+    const auto& copy_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+    const u64 copy_bytes = static_cast<u64>(cached_info.size.width) * cached_info.size.height *
+                           cached_info.size.depth * cached_info.num_bits / 8;
+    if (copy_bytes > copy_buffer.SizeBytes()) {
+        LOG_ERROR(Render_Vulkan, "Image dimension recreation needs {} bytes, buffer has {}",
+                  copy_bytes, copy_buffer.SizeBytes());
+        return {};
+    }
+
+    const auto& new_info = requested_info;
+    const auto new_image_id =
+        slot_images.insert(instance, scheduler, blit_helper, slot_image_views, new_info);
+    RegisterImage(new_image_id);
+
+    auto& new_image = slot_images[new_image_id];
+    auto& source_image = slot_images[cache_image_id];
+    new_image.usage = source_image.usage;
+
+    // Fold any pending CPU or buffer-cache changes into the old backing before moving its
+    // authoritative contents through a dimension-neutral buffer copy.
+    RefreshImage(source_image);
+    new_image.CopyImageWithBuffer(source_image, copy_buffer.Handle(), 0);
+    new_image.flags &= ~ImageFlagBits::Dirty;
+    new_image.flags |= source_image.flags & ImageFlagBits::GpuModified;
+
+    if (source_image.binding.is_bound || source_image.binding.is_target) {
+        source_image.binding.needs_rebind = 1u;
+    }
+    FreeImage(cache_image_id);
+    return new_image_id;
+}
+
 std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& image_info,
                                                            BindingType binding,
                                                            ImageId cache_image_id,
@@ -294,6 +442,11 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {depth_image_id, -1, -1};
         }
 
+        if (const auto dimension_image_id =
+                ResolveDimensionOverlap(image_info, cache_image_id)) {
+            return {dimension_image_id, -1, -1};
+        }
+
         // Compressed view of uncompressed image with same block size.
         if (image_info.props.is_block && !cache_image.info.props.is_block) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
@@ -310,9 +463,11 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             image_info.guest_size <= cache_image.info.guest_size) {
             auto result_id = merged_image_id ? merged_image_id : cache_image_id;
             const auto& result_image = slot_images[result_id];
-            const bool is_compatible =
+            const bool is_format_compatible =
                 IsVulkanFormatCompatible(result_image.info.pixel_format, image_info.pixel_format);
-            return {is_compatible ? result_id : ImageId{}, -1, -1};
+            const bool is_view_compatible =
+                IsViewTypeCompatible(image_info.type, result_image.info.type);
+            return {is_format_compatible && is_view_compatible ? result_id : ImageId{}, -1, -1};
         }
 
         // Size and resources are greater, expand the image.
@@ -505,7 +660,10 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
-    ASSERT(info.guest_address != 0);
+
+    if (info.guest_address == 0) [[unlikely]] {
+        return GetNullImage(info.pixel_format);
+    }
 
     std::scoped_lock lock{mutex};
     ImageIds image_ids;
@@ -527,7 +685,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             continue;
         }
         if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
-            (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
+            !IsViewTypeCompatible(info.type, cache_image.info.type)) {
             continue;
         }
         if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
@@ -620,11 +778,10 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+    LogViewDimensionMismatch(desc, image);
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0) {
-            std::unique_lock lk{download_images_mutex};
+        if (readback_linear_images && !image.info.props.is_tiled && image.info.guest_address != 0) {
             download_images.emplace(image_id);
         }
     }
@@ -635,8 +792,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
-        std::unique_lock lk{download_images_mutex};
+    if (readback_linear_images && !image.info.props.is_tiled) {
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
@@ -645,13 +801,13 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
         surface_metas.emplace(desc.info.meta_info.cmask_addr,
-                              MetaDataInfo{.type = MetaType::CMask});
+                              MetaDataInfo{.type = MetaDataInfo::Type::CMask});
         image.info.meta_info.cmask_addr = desc.info.meta_info.cmask_addr;
     }
 
     if (desc.info.meta_info.fmask_addr) {
         surface_metas.emplace(desc.info.meta_info.fmask_addr,
-                              MetaDataInfo{.type = MetaType::FMask});
+                              MetaDataInfo{.type = MetaDataInfo::Type::FMask});
         image.info.meta_info.fmask_addr = desc.info.meta_info.fmask_addr;
     }
 
@@ -667,7 +823,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
         surface_metas.emplace(desc.info.meta_info.htile_addr,
-                              MetaDataInfo{.type = MetaType::HTile,
+                              MetaDataInfo{.type = MetaDataInfo::Type::HTile,
                                            .clear_mask = image.info.meta_info.htile_clear_mask});
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
     }
@@ -790,21 +946,29 @@ void TextureCache::RefreshImage(Image& image) {
         copy.bufferOffset += offset;
     }
 
+    if (image.info.guest_size >= 0x700000) {
+        // Close the Mode A blind spot: stamp buffer_cache (or stream) source as detile-read.
+        // Host dispatch log often has srcResource=0; guest track is authoritative for FHD src.
+        buffer_cache.NoteDetileSourceUse(in_buffer->Handle(), in_offset, image.info.guest_size,
+                                         "detile_src");
+        if (StagingVerbose()) {
+            LOG_WARNING(Render_Vulkan,
+                        "IMAGE_UPLOAD_CHAIN size={:#x} srcBuffer={:#x} srcOffset={:#x} "
+                        "detileDst={:#x} detileOffset={:#x} tick={} w={} h={} tiled={}",
+                        image.info.guest_size, u64(VkBuffer(in_buffer->Handle())), in_offset,
+                        u64(VkBuffer(buffer)), offset, scheduler.CurrentTick(),
+                        image.info.size.width, image.info.size.height,
+                        image.info.props.is_tiled ? 1 : 0);
+        }
+    }
+
     image.Upload(image_copies, buffer, offset);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base) {
     const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
-
-    std::scoped_lock lock{samplers_mutex};
     const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base);
-    if (new_sampler) {
-        samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, gc_tick);
-    } else {
-        sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
-    }
-
     return it->second.Handle();
 }
 
@@ -950,7 +1114,10 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     tracker.UpdatePageWatchers<false>(addr, size);
 }
 
-void TextureCache::GarbageCollectImages() {
+void TextureCache::RunGarbageCollector() {
+    SCOPE_EXIT {
+        ++gc_tick;
+    };
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
@@ -1014,55 +1181,6 @@ void TextureCache::GarbageCollectImages() {
     }
 }
 
-void TextureCache::GarbageCollectSamplers() {
-    total_used_samplers = samplers.size();
-    if (total_used_samplers < trigger_gc_samplers) {
-        return;
-    }
-    std::scoped_lock lock{samplers_mutex};
-    bool pressured = false;
-    bool aggresive = false;
-    u64 ticks_to_destroy = 0;
-    size_t num_deletions = 0;
-
-    const auto configure = [&](bool allow_aggressive) {
-        pressured = total_used_samplers >= pressure_gc_samplers;
-        aggresive = allow_aggressive && total_used_samplers >= critical_gc_samplers;
-        ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
-        ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
-        num_deletions = aggresive ? 40 : pressured ? 20 : 10;
-    };
-    const auto clean_up = [&](u64 hash) {
-        if (num_deletions == 0) {
-            return true;
-        }
-        --num_deletions;
-        const size_t lru_id = samplers.at(hash).lru_id;
-        samplers.erase(hash);
-        sampler_lru_cache.Free(lru_id);
-        return false;
-    };
-
-    // Try to remove anything old enough and not high priority.
-    configure(false);
-    sampler_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
-
-    if (total_used_samplers >= critical_gc_samplers) {
-        // If we are still over the critical limit, run an aggressive GC
-        configure(true);
-        sampler_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
-    }
-}
-
-void TextureCache::RunGarbageCollector() {
-    SCOPE_EXIT {
-        ++gc_tick;
-    };
-
-    GarbageCollectImages();
-    GarbageCollectSamplers();
-}
-
 void TextureCache::TouchImage(const Image& image) {
     lru_cache.Touch(image.lru_id, gc_tick);
 }
@@ -1082,13 +1200,6 @@ void TextureCache::DeleteImage(ImageId image_id) {
     }
     if (meta_info.htile_addr) {
         surface_metas.erase(meta_info.htile_addr);
-    }
-
-    {
-        std::unique_lock lk{download_images_mutex};
-        if (download_images.contains(image_id)) {
-            download_images.erase(image_id);
-        }
     }
 
     // Reclaim image and any image views it references.

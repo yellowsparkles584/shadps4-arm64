@@ -13,8 +13,8 @@ namespace AmdGpu {
 
 // Table 8.5 Buffer Resource Descriptor [Sea Islands Series Instruction Set Architecture]
 struct Buffer {
-    u64 base_address : 40;
-    u64 _padding0 : 8;
+    u64 base_address : 44;
+    u64 _padding0 : 4;
     u64 stride : 14;
     u64 cache_swizzle : 1;
     u64 swizzle_enable : 1;
@@ -373,6 +373,23 @@ enum class AnisoRatio : u64 {
     Sixteen,
 };
 
+/// GCN TEX max_aniso is 3 bits. 0-4 are 1/2/4/8/16. 5-7 are reserved; treat as 16.
+[[nodiscard]] constexpr float AnisoRatioToFloat(AnisoRatio ratio) noexcept {
+    switch (ratio) {
+    case AnisoRatio::One:
+        return 1.0f;
+    case AnisoRatio::Two:
+        return 2.0f;
+    case AnisoRatio::Four:
+        return 4.0f;
+    case AnisoRatio::Eight:
+        return 8.0f;
+    case AnisoRatio::Sixteen:
+    default:
+        return 16.0f;
+    }
+}
+
 enum class DepthCompare : u64 {
     Never = 0,
     Less = 1,
@@ -478,20 +495,7 @@ struct Sampler {
     }
 
     float MaxAniso() const {
-        switch (max_aniso.Value()) {
-        case AnisoRatio::One:
-            return 1.0f;
-        case AnisoRatio::Two:
-            return 2.0f;
-        case AnisoRatio::Four:
-            return 4.0f;
-        case AnisoRatio::Eight:
-            return 8.0f;
-        case AnisoRatio::Sixteen:
-            return 16.0f;
-        default:
-            UNREACHABLE();
-        }
+        return AnisoRatioToFloat(max_aniso.Value());
     }
 };
 

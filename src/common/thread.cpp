@@ -255,13 +255,9 @@ std::string GetCurrentThreadName() {
         return g_curthread->name;
     }
 #ifdef _WIN32
-    PWSTR name{};
-    if (FAILED(GetThreadDescription(GetCurrentThread(), &name)) || name == nullptr) {
-        return "<unknown name>";
-    }
-    const auto result = Common::UTF16ToUTF8(name);
-    LocalFree(name);
-    return result;
+    PWSTR name;
+    GetThreadDescription(GetCurrentThread(), &name);
+    return Common::UTF16ToUTF8(name);
 #else
     char name[256];
     if (pthread_getname_np(pthread_self(), name, sizeof(name)) != 0) {

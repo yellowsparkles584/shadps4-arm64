@@ -15,8 +15,8 @@ ResourcePool::ResourcePool(MasterSemaphore* master_semaphore_, std::size_t grow_
 
 std::size_t ResourcePool::CommitResource() {
     u64 gpu_tick = master_semaphore->KnownGpuTick();
-    const auto search = [this, gpu_tick](std::size_t begin,
-                                         std::size_t end) -> std::optional<std::size_t> {
+    const auto search = [this, &gpu_tick](std::size_t begin,
+                                          std::size_t end) -> std::optional<std::size_t> {
         for (std::size_t iterator = begin; iterator < end; ++iterator) {
             if (gpu_tick >= ticks[iterator]) {
                 ticks[iterator] = master_semaphore->CurrentTick();
@@ -29,21 +29,23 @@ std::size_t ResourcePool::CommitResource() {
     // Try to find a free resource from the hinted position to the end.
     auto found = search(hint_iterator, ticks.size());
     if (!found) {
-        // Refresh semaphore to query updated results
+        // Search the full ring using the cached tick before querying the driver.
+        found = search(0, hint_iterator);
+    }
+    if (!found) {
         master_semaphore->Refresh();
         gpu_tick = master_semaphore->KnownGpuTick();
         found = search(hint_iterator, ticks.size());
+        if (!found) {
+            found = search(0, hint_iterator);
+        }
     }
     if (!found) {
-        // Search from beginning to the hinted position.
-        found = search(0, hint_iterator);
-        if (!found) {
-            // Both searches failed, the pool is full; handle it.
-            const std::size_t free_resource = ManageOverflow();
+        // Both searches failed, the pool is full; handle it.
+        const std::size_t free_resource = ManageOverflow();
 
-            ticks[free_resource] = master_semaphore->CurrentTick();
-            found = free_resource;
-        }
+        ticks[free_resource] = master_semaphore->CurrentTick();
+        found = free_resource;
     }
 
     // Free iterator is hinted to the resource after the one that's been commited.
@@ -62,6 +64,7 @@ constexpr std::size_t COMMAND_BUFFER_POOL_SIZE = 4;
 
 CommandPool::CommandPool(const Instance& instance, MasterSemaphore* master_semaphore)
     : ResourcePool{master_semaphore, COMMAND_BUFFER_POOL_SIZE}, instance{instance} {
+    std::fprintf(stderr, "BACHATA_COMMAND_POOL_ENTER\n");
     const vk::CommandPoolCreateInfo pool_create_info = {
         .flags = vk::CommandPoolCreateFlagBits::eTransient |
                  vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -73,6 +76,7 @@ CommandPool::CommandPool(const Instance& instance, MasterSemaphore* master_semap
                vk::to_string(pool_result));
     cmd_pool = std::move(pool);
     SetObjectName(device, *cmd_pool, "CommandPool");
+    std::fprintf(stderr, "BACHATA_COMMAND_POOL_READY\n");
 }
 
 CommandPool::~CommandPool() = default;
@@ -110,11 +114,39 @@ DescriptorHeap::DescriptorHeap(const Instance& instance, MasterSemaphore* master
 }
 
 DescriptorHeap::~DescriptorHeap() {
+    if (master_semaphore == nullptr) {
+        // Default-constructed, never-assigned heap. Nothing to destroy.
+        return;
+    }
     device.destroyDescriptorPool(curr_pool);
     for (const auto [pool, tick] : pending_pools) {
         master_semaphore->Wait(tick);
         device.destroyDescriptorPool(pool);
     }
+}
+
+DescriptorHeap& DescriptorHeap::operator=(DescriptorHeap&& other) noexcept {
+    if (this != &other) {
+        // Destroy our current state first (may be default-constructed/inert).
+        if (master_semaphore != nullptr) {
+            device.destroyDescriptorPool(curr_pool);
+            for (const auto [pool, tick] : pending_pools) {
+                master_semaphore->Wait(tick);
+                device.destroyDescriptorPool(pool);
+            }
+        }
+        device = other.device;
+        master_semaphore = other.master_semaphore;
+        descriptor_heap_count = other.descriptor_heap_count;
+        pool_sizes = other.pool_sizes;
+        curr_pool = other.curr_pool;
+        pending_pools = std::move(other.pending_pools);
+        descriptor_sets = std::move(other.descriptor_sets);
+        // Leave the source inert so its destructor is a no-op.
+        other.master_semaphore = nullptr;
+        other.curr_pool = nullptr;
+    }
+    return *this;
 }
 
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {

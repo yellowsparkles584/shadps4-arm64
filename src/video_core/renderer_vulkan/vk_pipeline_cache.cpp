@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <exception>
 #include <ranges>
 
 #include "common/hash.h"
@@ -9,11 +10,13 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/fma_split_diag.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/renderer_vulkan/legacy_vertex_attributes.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -131,7 +134,6 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
     }
     case Stage::Vertex: {
         BuildCommon(regs.vs_program);
-        info.vs_info.user_clip_plane_mask = regs.clipper_control.user_clip_plane_enable;
         info.vs_info.step_rate_0 = regs.vgt_instance_step_rate_0;
         info.vs_info.step_rate_1 = regs.vgt_instance_step_rate_1;
         info.vs_info.num_outputs = MapOutputs(info.vs_info.outputs, regs.vs_output_control);
@@ -223,16 +225,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
             info.fs_info.color_buffers[i] = graphics_key.color_buffers[i];
         }
-        // Lowered user clip planes ride the same emulation path as guest-exported distances, so
-        // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
-        // locations in sync with the shifted vertex outputs.
-        const bool lowers_user_clip_planes =
-            regs.clipper_control.user_clip_plane_enable &&
-            !regs.stage_enable.IsStageEnabled(static_cast<u32>(Stage::Geometry));
         info.fs_info.clip_distance_emulation =
-            ((regs.vs_output_control.clip_distance_enable &&
-              !regs.stage_enable.IsStageEnabled(static_cast<u32>(Stage::Local))) ||
-             lowers_user_clip_planes) &&
+            regs.vs_output_control.clip_distance_enable &&
+            !regs.stage_enable.IsStageEnabled(static_cast<u32>(Stage::Local)) &&
             profile.needs_clip_distance_emulation;
         break;
     }
@@ -259,6 +254,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
+        // When binding a UBO, we calculate its size considering the offset in the larger buffer
+        // cache underlying resource. In some cases, it may produce sizes exceeding the system
+        // maximum allowed UBO range, so we need to reduce the threshold to prevent issues.
+        .max_ubo_size = instance.UniformMaxSize() - instance.UniformMinAlignment(),
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
         .max_shared_memory_size = instance.MaxComputeSharedMemorySize(),
@@ -288,6 +287,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             bool(vk12_props.shaderSignedZeroInfNanPreserveFloat32),
         .support_fp64_signed_zero_inf_nan_preserve =
             bool(vk12_props.shaderSignedZeroInfNanPreserveFloat64),
+        .support_legacy_vertex_attributes = instance_.IsLegacyVertexAttributesSupported(),
         .supports_image_load_store_lod = instance_.IsImageLoadStoreLodSupported(),
         .supports_native_cube_calc = instance_.IsAmdGcnShaderSupported(),
         .supports_trinary_minmax = instance_.IsAmdShaderTrinaryMinMaxSupported(),
@@ -308,8 +308,19 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+        .needs_bit_preserving_buffer0_loads =
+            ShouldForceBitPreservingBuffer0Loads(instance_.GetModelName()),
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .supports_shader_cull_distance = instance_.IsShaderCullDistanceSupported(),
+        .max_clip_distances = instance_.GetMaxClipDistances(),
+        .max_cull_distances = instance_.GetMaxCullDistances(),
+        .max_combined_clip_and_cull_distances = instance_.GetMaxCombinedClipAndCullDistances(),
     };
+    if (profile.needs_bit_preserving_buffer0_loads) {
+        LOG_WARNING(Render_Vulkan,
+                    "Forcing buffer #0 F32 loads as U32 bitcast on {} (IEEE-bit preserving)",
+                    instance_.GetModelName());
+    }
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -330,9 +341,28 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+        try {
+            if (const auto* vs = infos[u32(Shader::LogicalStage::Vertex)]) {
+                LOG_INFO(Render_Vulkan,
+                         "Pipeline {:#x} resources vs buf={} img={} samp={} fetch={}",
+                         pipeline_hash, vs->buffers.size(), vs->images.size(), vs->samplers.size(),
+                         fetch_shader ? fetch_shader->attributes.size() : 0);
+            }
+            if (const auto* fs = infos[u32(Shader::LogicalStage::Fragment)]) {
+                LOG_INFO(Render_Vulkan, "Pipeline {:#x} resources fs buf={} img={} samp={}",
+                         pipeline_hash, fs->buffers.size(), fs->images.size(),
+                         fs->samplers.size());
+            }
+            it.value() = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+                runtime_infos, fetch_shader, modules, sdata, false);
+        } catch (const std::exception& ex) {
+            LOG_ERROR(Render_Vulkan, "Graphics pipeline {:#x} compile failed: {}", pipeline_hash,
+                      ex.what());
+            it.value().reset();
+            fetch_shader.reset();
+            return nullptr;
+        }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -502,8 +532,13 @@ bool PipelineCache::RefreshGraphicsStages() {
 
     infos.fill(nullptr);
     modules.fill(nullptr);
-
-    bind_stage(Stage::Fragment, LogicalStage::Fragment);
+    const auto result = bind_stage(Stage::Fragment, LogicalStage::Fragment);
+    if (!result && regs.vs_output_control.clip_distance_enable &&
+        profile.needs_clip_distance_emulation) {
+        // TODO: need to implement a discard only fallback shader
+        LOG_WARNING(Render_Vulkan,
+                    "Clip distance emulation is ineffective due to absense of fragment shader");
+    }
 
     const auto* fs_info = infos[static_cast<u32>(LogicalStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
@@ -609,6 +644,26 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.stage, perm_idx, "spv");
+    if (Shader::Backend::SPIRV::ShouldSplitFmaNoContraction(info.pgm_hash, info.stage) &&
+        EmulatorSettings.IsDumpShaders()) {
+        const auto scan = Shader::Backend::SPIRV::ScanSpirvFmaOps(spv);
+        const bool survived = Shader::Backend::SPIRV::SplitFmaSurvivedBackend(scan) &&
+                              scan.contraction_off > 0;
+        using namespace Common::FS;
+        const auto dump_dir = GetUserPath(PathType::ShaderDir) / "dumps";
+        if (!std::filesystem::exists(dump_dir)) {
+            std::filesystem::create_directories(dump_dir);
+        }
+        const auto filename =
+            fmt::format("{}.fmasplit.txt", GetShaderName(info.stage, info.pgm_hash, perm_idx));
+        const auto file = IOFile{dump_dir / filename, FileAccessMode::Create};
+        const auto text = fmt::format(
+            "A830_FMA_SPLIT spirv scan\nshader={:#x}\nOpFMul={}\nOpFAdd={}\nGLSLstd450Fma={}\n"
+            "OpFmaKHR={}\nNoContraction={}\nContractionOff={}\nsurvived={}\n",
+            info.pgm_hash, scan.op_fmul, scan.op_fadd, scan.glsl_fma, scan.op_fma_khr,
+            scan.no_contraction, scan.contraction_off, survived ? "YES" : "NO");
+        file.WriteString(std::span<const char>{text.data(), text.size()});
+    }
 
     vk::ShaderModule module;
 

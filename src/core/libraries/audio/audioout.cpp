@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -184,7 +185,7 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
             }
         }
 
-        port->output_cv.notify_all();
+        port->output_cv.notify_one();
 
         if (stop.stop_requested()) {
             break;
@@ -192,13 +193,6 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
 
         timer.End();
     }
-
-    {
-        std::unique_lock lock{port->mutex};
-        port->closing = true;
-        port->output_ready = false;
-    }
-    port->output_cv.notify_all();
 }
 
 /*
@@ -212,11 +206,15 @@ s32 PS4_SYSV_ABI sceAudioOutInit() {
         return ORBIS_AUDIO_OUT_ERROR_ALREADY_INIT;
     }
 
+#ifdef ENABLE_BACHATA_RUNTIME
+    audio = std::make_unique<BachataAudioOut>();
+#else
     if (EmulatorSettings.GetAudioBackend() == AudioBackend::OpenAL) {
         audio = std::make_unique<OpenALAudioOut>();
     } else {
         audio = std::make_unique<SDLAudioOut>();
     }
+#endif
 
     LOG_INFO(Lib_AudioOut, "Audio system initialized");
     return ORBIS_OK;
@@ -336,7 +334,8 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
         }
 
         // Start output thread - pass shared_ptr by value to keep port alive
-        port->output_thread.Run([port](std::stop_token stop) { AudioOutputThread(port, stop); });
+        port->output_thread.Run(
+            [port](const std::stop_token& stop) { AudioOutputThread(port, stop); });
 
         // Set initial volume
         port->impl->SetVolume(port->volume);
@@ -357,6 +356,17 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
     s32 handle = (_type << 16) | port_id | 0x20000000;
     return handle;
 }
+
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+s32 PS4_SYSV_ABI fex_sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
+                                     OrbisAudioOutPort port_type, s32 index, u32 length,
+                                     u32 sample_rate, u32 param_raw) {
+    OrbisAudioOutParamExtendedInformation param_type{};
+    static_assert(sizeof(param_type) == sizeof(param_raw));
+    std::memcpy(&param_type, &param_raw, sizeof(param_type));
+    return sceAudioOutOpen(user_id, port_type, index, length, sample_rate, param_type);
+}
+#endif
 
 s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
     LOG_INFO(Lib_AudioOut, "handle = {:#x}", handle);
@@ -399,22 +409,10 @@ s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
         return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
     }
 
-    // Kick out any guest thread blocked in sceAudioOutOutput before joining.
-    {
-        std::unique_lock port_lock{port->mutex};
-        port->closing = true;
-        port->output_ready = false;
-    }
-    port->output_cv.notify_all();
-
-    // Stop the output thread.
+    // Stop the output thread
     port->output_thread.Stop();
 
-    {
-        std::unique_lock port_lock{port->mutex};
-        std::free(port->output_buffer);
-        port->output_buffer = nullptr;
-    }
+    std::free(port->output_buffer);
 
     LOG_DEBUG(Lib_AudioOut, "Closed audio port {}", port_id);
     return ORBIS_OK;
@@ -566,12 +564,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
     s32 samples_sent = 0;
     {
         std::unique_lock lock{port->mutex};
-        port->output_cv.wait(lock, [&] { return !port->output_ready || port->closing; });
-
-        if (port->closing) {
-            LOG_DEBUG(Lib_AudioOut, "Port {} closed while waiting for drain", port_id);
-            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
-        }
+        port->output_cv.wait(lock, [&] { return !port->output_ready; });
 
         if (ptr != nullptr) {
             std::memcpy(port->output_buffer, ptr, port->BufferSize());
@@ -668,13 +661,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
 
     // Wait for all ports to be ready
     for (u32 i = 0; i < num; i++) {
-        ports[i]->output_cv.wait(locks[i],
-                                 [&] { return !ports[i]->output_ready || ports[i]->closing; });
-
-        if (ports[i]->closing) {
-            LOG_DEBUG(Lib_AudioOut, "Port closed while waiting for drain");
-            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
-        }
+        ports[i]->output_cv.wait(locks[i], [&] { return !ports[i]->output_ready; });
     }
 
     // Copy data to all ports
@@ -1178,7 +1165,12 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceAudioOutMasteringSetParam);
     LIB_FUNCTION("RVWtUgoif5o", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutMasteringTerm);
     LIB_FUNCTION("-LXhcGARw3k", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutMbusInit);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    LIB_FUNCTION("ekNvsT22rsY", "libSceAudioOut", 1, "libSceAudioOut",
+                 fex_sceAudioOutOpen);
+#else
     LIB_FUNCTION("ekNvsT22rsY", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOpen);
+#endif
     LIB_FUNCTION("qLpSK75lXI4", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOpenEx);
     LIB_FUNCTION("QOQtbeDqsT4", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOutput);
     LIB_FUNCTION("w3PdaSTSwGE", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOutputs);

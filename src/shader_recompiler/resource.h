@@ -7,6 +7,7 @@
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
 
+#include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
 namespace Shader {
@@ -14,7 +15,7 @@ namespace Shader {
 static constexpr u32 NUM_USER_DATA_REGS = 16;
 static constexpr u32 NUM_IMAGES = 64;
 static constexpr u32 NUM_BUFFERS = 40;
-static constexpr u32 NUM_SAMPLERS = 16;
+static constexpr u32 NUM_SAMPLERS = 32;
 static constexpr u32 NUM_FMASKS = 8;
 
 enum class BufferType : u32 {
@@ -24,7 +25,6 @@ enum class BufferType : u32 {
     FaultBuffer,
     GdsBuffer,
     SharedMemory,
-    ClipPlanes,
 };
 
 struct Info;
@@ -37,9 +37,21 @@ struct BufferResource {
     u8 instance_attrib{};
     bool is_written{};
     bool is_formatted{};
+    bool used_as_readconst{};
 
     bool IsSpecial() const noexcept {
         return buffer_type != BufferType::Guest;
+    }
+
+    bool IsStorage([[maybe_unused]] const AmdGpu::Buffer buffer) const noexcept {
+        // When using uniform buffers, a size is required at compilation time, so we need to
+        // either compile a lot of shader specializations to handle each size or just force it to
+        // the maximum possible size always. However, for some vendors the shader-supplied size is
+        // used for bounds checking uniform buffer accesses, so the latter would effectively turn
+        // off buffer robustness behavior. Instead, force storage buffers which are bounds checked
+        // using the actual buffer size. We are assuming the performance hit from this is
+        // acceptable.
+        return true; // buffer.GetSize() > profile.max_ubo_size || is_written;
     }
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
@@ -64,6 +76,9 @@ using BufferResourceList = boost::container::static_vector<BufferResource, NUM_B
 enum class MipStorageFallbackMode : u32 { None, DynamicIndex, ConstantIndex };
 
 struct ImageResource {
+    static constexpr f32 Hosted2DSampleY = 0.5f;
+    static constexpr u32 Hosted2DIntegerY = 0u;
+
     u32 sharp_idx;
     bool is_depth{};
     bool is_atomic{};
@@ -72,6 +87,18 @@ struct ImageResource {
     bool is_r128{};
     MipStorageFallbackMode mip_fallback_mode{};
     u32 constant_mip_index{};
+
+    bool Is1DHostedAs2D(const AmdGpu::Image& sharp) const noexcept {
+        return !is_array && !is_written && !is_depth && !is_atomic && !is_r128 &&
+               sharp.GetType() == AmdGpu::ImageType::Color1D && sharp.height == 0 &&
+               sharp.NumLayers() == 1 && sharp.NumLevels() == 1 && sharp.NumSamples() == 1 &&
+               sharp.GetTileMode() == AmdGpu::TileMode::Thin2DThin;
+    }
+
+    AmdGpu::ImageType GetHostViewType(const AmdGpu::Image& sharp) const noexcept {
+        return Is1DHostedAs2D(sharp) ? AmdGpu::ImageType::Color2D
+                                    : sharp.GetViewType(is_array);
+    }
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
@@ -104,7 +131,7 @@ struct ImageResource {
                    : 1;
     }
 };
-using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
+using ImageResourceList = boost::container::small_vector<ImageResource, NUM_IMAGES>;
 
 struct SamplerResource {
     u32 sharp_idx;
@@ -118,7 +145,7 @@ struct SamplerResource {
                                  : info.template ReadUdSharp<AmdGpu::Sampler>(sharp_idx);
     }
 };
-using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM_SAMPLERS>;
+using SamplerResourceList = boost::container::small_vector<SamplerResource, NUM_SAMPLERS>;
 
 struct FMaskResource {
     u32 sharp_idx;

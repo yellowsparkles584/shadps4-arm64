@@ -178,7 +178,8 @@ static void CheckAndMigrateTrophies(TransferOption option) {
     auto const user_dir = EmulatorSettings.GetHomeDir() / "1000";
     auto const old_trophy_base_dir =
         Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "game_data";
-    auto const new_trophy_global_dir = Common::FS::GetUserPath(Common::FS::PathType::TrophyDir);
+    auto const new_trophy_global_dir =
+        Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "trophy";
     try {
         for (auto const& entry : fs::directory_iterator(old_trophy_base_dir)) {
             if (!entry.is_directory()) {
@@ -297,7 +298,11 @@ Users UserManager::CreateDefaultUsers() {
             std::filesystem::create_directory(user_dir / "trophy");
             std::filesystem::create_directory(user_dir / "inputs");
             if (u.user_id == 1000) {
+#ifdef ENABLE_BACHATA_RUNTIME
+                constexpr TransferOption user_choice = TransferOption::Nothing;
+#else
                 TransferOption user_choice = AskMigrationOption();
+#endif
                 CheckAndMigrateSaves(user_choice);
                 CheckAndMigrateTrophies(user_choice);
             }

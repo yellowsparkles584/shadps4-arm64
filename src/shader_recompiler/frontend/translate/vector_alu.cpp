@@ -166,8 +166,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_FLOOR_F32(inst);
     case Opcode::V_EXP_F32:
         return V_EXP_F32(inst);
-    case Opcode::V_LOG_CLAMP_F32:
-        return V_LOG_F32(inst);
     case Opcode::V_LOG_F32:
         return V_LOG_F32(inst);
     case Opcode::V_RCP_F32:
@@ -689,17 +687,15 @@ void Translator::V_BFM_B32(const GcnInst& inst) {
 }
 
 void Translator::V_MAC_F32(const GcnInst& inst) {
-    const auto src0 = GetSrc<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc<IR::F32>(inst.src[1]);
-    const auto dst0 = GetSrc<IR::F32>(inst.dst[0]);
-    SetDst(inst.dst[0], ir.FPAdd(ir.FPMul(src0, src1), dst0));
+    SetDst(inst.dst[0], ir.FPFma(GetSrc<IR::F32>(inst.src[0]), GetSrc<IR::F32>(inst.src[1]),
+                                 GetSrc<IR::F32>(inst.dst[0])));
 }
 
 void Translator::V_MADMK_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
     const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
     const IR::F32 k{GetSrc<IR::F32>(inst.src[2])};
-    SetDst(inst.dst[0], ir.FPAdd(ir.FPMul(src0, k), src1));
+    SetDst(inst.dst[0], ir.FPFma(src0, k, src1));
 }
 
 void Translator::V_BCNT_U32_B32(const GcnInst& inst) {
@@ -741,14 +737,13 @@ void Translator::V_MBCNT_U32_B32(bool is_low, const GcnInst& inst) {
 }
 
 void Translator::V_ADD_I32(const GcnInst& inst) {
-    // The sum is identical for signed and unsigned components. VCC (or the VOP3 scalar
-    // destination) receives the unsigned carry-out, despite the legacy _I32 mnemonic.
+    // Signed or unsigned components
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result{ir.IAdd(src0, src1)};
     SetDst(inst.dst[0], result);
 
-    SetCarryOut(inst, ir.ILessThan(result, src0, false));
+    // TODO: Carry-out with signed or unsigned components
 }
 
 void Translator::V_SUB_I32(const GcnInst& inst) {
@@ -1189,12 +1184,7 @@ void Translator::V_CMP_F32(ConditionOp op, bool set_exec, const GcnInst& inst) {
         }
     }();
     if (set_exec) {
-        // V_CMPX evaluates on active lanes only; hardware writes exec & result to both EXEC
-        // and the VCC/SDST destination, zeroing inactive lanes' bits.
-        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
-        ir.SetExec(masked);
-        SetDst1(inst.dst[1], masked);
-        return;
+        ir.SetExec(result);
     }
     SetDst1(inst.dst[1], result);
 }
@@ -1225,11 +1215,7 @@ void Translator::V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst) {
         }
     }();
     if (set_exec) {
-        // See the V_CMPX note in V_CMP_F32.
-        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
-        ir.SetExec(masked);
-        SetDst1(inst.dst[1], masked);
-        return;
+        ir.SetExec(result);
     }
     SetDst1(inst.dst[1], result);
 }
@@ -1260,11 +1246,7 @@ void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const 
         }
     }();
     if (set_exec) {
-        // See the V_CMPX note in V_CMP_F32.
-        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
-        ir.SetExec(masked);
-        SetDst1(inst.dst[1], masked);
-        return;
+        ir.SetExec(result);
     }
     SetDst1(inst.dst[1], result);
 }
@@ -1339,7 +1321,7 @@ void Translator::V_MAD_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
     const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
     const IR::F32 src2{GetSrc<IR::F32>(inst.src[2])};
-    SetDst(inst.dst[0], ir.FPAdd(ir.FPMul(src0, src1), src2));
+    SetDst(inst.dst[0], ir.FPFma(src0, src1, src2));
 }
 
 void Translator::V_MAD_I32_I24(const GcnInst& inst, bool is_signed) {
@@ -1905,7 +1887,7 @@ void Translator::V_MAD_MIX_F32(const GcnInst& inst) {
     const auto src1 = GetSrcMix(inst.src[1]);
     const auto src2 = GetSrcMix(inst.src[2]);
 
-    const IR::F32 result = ir.FPAdd(ir.FPMul(src0, src1), src2);
+    const IR::F32 result = ir.FPFma(src0, src1, src2);
 
     SetDst(inst.dst[0], result);
 }
@@ -1915,7 +1897,7 @@ void Translator::V_MAD_MIXLO_F16(const GcnInst& inst) {
     const auto src1 = GetSrcMix(inst.src[1]);
     const auto src2 = GetSrcMix(inst.src[2]);
 
-    const IR::F32 result = ir.FPAdd(ir.FPMul(src0, src1), src2);
+    const IR::F32 result = ir.FPFma(src0, src1, src2);
     const IR::F16 result_f16 = ir.FPConvert(16, result);
     const IR::U16 result_f16_u16 = ir.BitCast<IR::U16, IR::F16>(result_f16);
 
@@ -1930,7 +1912,7 @@ void Translator::V_MAD_MIXHI_F16(const GcnInst& inst) {
     const auto src1 = GetSrcMix(inst.src[1]);
     const auto src2 = GetSrcMix(inst.src[2]);
 
-    const IR::F32 result = ir.FPAdd(ir.FPMul(src0, src1), src2);
+    const IR::F32 result = ir.FPFma(src0, src1, src2);
     const IR::F16 result_f16 = ir.FPConvert(16, result);
     const IR::U16 result_f16_u16 = ir.BitCast<IR::U16, IR::F16>(result_f16);
 

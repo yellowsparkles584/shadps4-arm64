@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
 #include <mutex>
+#include <utility>
 #include <semaphore>
 #include <span>
 #include <thread>
@@ -93,6 +95,21 @@ public:
 
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
+    }
+
+    bool IsGpuThread() const {
+        return std::this_thread::get_id() == gpu_id;
+    }
+
+    bool InGfxTask() const {
+        return in_gfx_task.load(std::memory_order_relaxed);
+    }
+
+    void EnqueueCommand(auto&& func) {
+        std::scoped_lock lk{submit_mutex};
+        command_queue.emplace(std::forward<decltype(func)>(func));
+        ++num_commands;
+        submit_cv.notify_one();
     }
 
     template <bool wait_done = false>
@@ -230,7 +247,12 @@ private:
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;
+    std::atomic<bool> in_gfx_task{false};
     s32 curr_qid{-1};
+#ifdef ENABLE_BACHATA_RUNTIME
+    u32 debug_last_opcode{};
+    u64 debug_resume_count{};
+#endif
 };
 
 } // namespace AmdGpu

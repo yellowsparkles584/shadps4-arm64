@@ -167,12 +167,20 @@ static HttpSettings* ResolveSettings(int id, const char*& level) {
     return nullptr;
 }
 
+// Handles are opaque integers cast to void*. The FEX HLE-call adapter rejects
+// non-null pointer arguments below the null page (4096) with EFAULT, so keep
+// encoded handles above that range.
+static constexpr intptr_t kEpollHandleBase = 0x10000;
+
 static OrbisHttpEpollHandle EncodeEpollHandle(int id) {
-    return reinterpret_cast<OrbisHttpEpollHandle>(static_cast<intptr_t>(id));
+    if (id == 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<OrbisHttpEpollHandle>(kEpollHandleBase + id);
 }
 
 static int DecodeEpollHandle(OrbisHttpEpollHandle eh) {
-    return static_cast<int>(reinterpret_cast<intptr_t>(eh));
+    return static_cast<int>(reinterpret_cast<intptr_t>(eh) - kEpollHandleBase);
 }
 
 // Resolve the (epoll_id*, epoll_user_arg*) pair on a template/connection/request
@@ -1522,11 +1530,6 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
 
         plan.method = req.method;
         plan.method_str = req.method_str;
-        // np_web_api sends ORBIS_HTTP_METHOD_CUSTOM (8) with no method string as an
-        // out-of-band PATCH marker
-        if (plan.method == ORBIS_HTTP_METHOD_CUSTOM && plan.method_str.empty()) {
-            plan.method_str = "PATCH";
-        }
         plan.path = ExtractPathFromUrl(req.url);
         plan.settings = req.settings;
         if (auto conn_it = g_state.connections.find(req.conn_id);
@@ -2582,8 +2585,8 @@ int PS4_SYSV_ABI sceHttpGetStatusCode(int reqId, int* statusCode) {
     auto& req = *it->second;
     int wr = WaitForResponseReady(req, lock);
     if (wr == ORBIS_HTTP_ERROR_EAGAIN) {
-        LOG_DEBUG(Lib_Http, "reqId={}: response not yet ready, returning EAGAIN", reqId);
-        return ORBIS_HTTP_ERROR_EAGAIN;
+        LOG_DEBUG(Lib_Http, "reqId={}: response not yet ready, returning BEFORE_SEND", reqId);
+        return ORBIS_HTTP_ERROR_BEFORE_SEND;
     }
     if (wr != ORBIS_OK) {
         LOG_ERROR(Lib_Http, "Wait failed for reqId={}: {:#x}", reqId, static_cast<u32>(wr));

@@ -150,6 +150,7 @@ public:
         buffer.used_types |= desc.used_types;
         buffer.is_written |= desc.is_written;
         buffer.is_formatted |= desc.is_formatted;
+        buffer.used_as_readconst |= desc.used_as_readconst;
         return index;
     }
 
@@ -198,8 +199,6 @@ private:
     SamplerResourceList& sampler_resources;
     FMaskResourceList& fmask_resources;
 };
-
-} // Anonymous namespace
 
 void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& descriptors,
                       const Profile& profile) {
@@ -307,6 +306,8 @@ void PatchBufferArgs(IR::Block& block, IR::Inst& inst, Info& info) {
     inst.SetArg(IR::LoadBufferArgs::Address,
                 CalculateBufferAddress(ir, inst, info, buffer, buffer.stride));
 }
+
+} // Anonymous namespace
 
 void ResourceTrackingPassStub(IR::Program& program, const Profile& profile) {
     // Iterate resource instructions and patch them after finding the sharp.

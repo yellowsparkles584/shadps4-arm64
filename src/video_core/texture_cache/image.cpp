@@ -3,6 +3,7 @@
 
 #include <ranges>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -386,6 +387,15 @@ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffe
         .imageMemoryBarrierCount = static_cast<u32>(image_barriers.size()),
         .pImageMemoryBarriers = image_barriers.data(),
     });
+    // Provenance for late DEVICE_LOST digs. Keep this below normal release verbosity because
+    // uploads happen many times per frame.
+    LOG_TRACE(Render_Vulkan,
+                "COPY_BUFFER_TO_IMAGE_PROV srcBuffer={:#x} offset={:#x} size={:#x} "
+                "dstImage={:#x} tick={} copies={} width={} height={} guestSize={:#x} "
+                "path=Image::Upload",
+                u64(VkBuffer(buffer)), offset, info.guest_size, u64(VkImage(GetImage())),
+                scheduler->CurrentTick(), static_cast<u32>(upload_copies.size()), info.size.width,
+                info.size.height, info.guest_size);
     cmdbuf.copyBufferToImage(buffer, GetImage(), vk::ImageLayout::eTransferDstOptimal,
                              upload_copies);
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -672,15 +682,12 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
 void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
     const auto& src_info = src_image.info;
 
-    const auto dst_dim = info.props.is_block ? 2 : 0;
-    const auto mip_block_w = std::max(info.size.width >> (mip + dst_dim), 1u);
-    const auto mip_block_h = std::max(info.size.height >> (mip + dst_dim), 1u);
-    const auto mip_block_p = std::max(info.mips_layout[mip].pitch >> dst_dim, 1u);
-
-    const auto src_dim = src_info.props.is_block ? 2 : 0;
-    ASSERT(mip_block_w == (src_info.size.width >> src_dim));
-    ASSERT(mip_block_h == (src_info.size.height >> src_dim));
-    ASSERT(mip_block_p == (src_info.pitch >> src_dim));
+    const auto src_block_dim = src_info.BlockDim();
+    const auto dst_block_dim = info.BlockDim();
+    const auto mip_block_w = std::max(dst_block_dim.width >> mip, 1u);
+    const auto mip_block_h = std::max(dst_block_dim.height >> mip, 1u);
+    ASSERT(mip_block_w == src_block_dim.width);
+    ASSERT(mip_block_h == src_block_dim.height);
 
     const auto [src_layers, dst_layers] = SanitizeCopyLayers(src_info, info, src_info.size.depth);
 

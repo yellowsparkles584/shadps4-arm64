@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <algorithm>
-#include <ranges>
 #include <span>
 #include "common/types.h"
 #include "shader_recompiler/frontend/tessellation.h"
@@ -103,8 +101,6 @@ struct VertexRuntimeInfo : protected CommonEsVsRuntimeInfo {
     bool clip_disable{};
     u32 step_rate_0;
     u32 step_rate_1;
-    /// UCP_ENA bits from PA_CL_CLIP_CNTL, lowered to clip distances in the shader.
-    u32 user_clip_plane_mask{};
 
     bool operator<=>(const VertexRuntimeInfo& other) const noexcept = default;
 };

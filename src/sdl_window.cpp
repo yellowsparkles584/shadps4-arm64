@@ -22,7 +22,6 @@
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/system/userservice.h"
 #include "core/user_settings.h"
-#include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
@@ -83,7 +82,9 @@ static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
 
 static Uint32 SDLCALL PollController(void* userdata, SDL_TimerID timer_id, Uint32 interval) {
     auto* controller = reinterpret_cast<Input::GameController*>(userdata);
-    controller->PollState();
+    controller->UpdateAxisSmoothing();
+    controller->Gyro(0);
+    controller->Acceleration(0);
     return interval;
 }
 
@@ -100,33 +101,33 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     if (!SDL_SetHint(SDL_HINT_APP_NAME, "shadPS4")) {
         UNREACHABLE_MSG("Failed to set SDL window hint: {}", SDL_GetError());
     }
+    LOG_INFO(Input, "Initializing SDL video subsystem");
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         UNREACHABLE_MSG("Failed to initialize SDL video subsystem: {}", SDL_GetError());
     }
-    // On macOS, the future Intel compatibility environment does not include camera frameworks.
-    // Just skip initializing it entirely, no point in splitting old vs new OS versions here.
-#ifndef __APPLE__
+    LOG_INFO(Input, "SDL video subsystem initialized");
     if (!SDL_Init(SDL_INIT_CAMERA)) {
         LOG_ERROR(Input, "Failed to initialize SDL camera subsystem: {}", SDL_GetError());
     }
-#endif
     SDL_InitSubSystem(SDL_INIT_AUDIO);
 
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING,
                           std::string(window_title).c_str());
+#ifdef ENABLE_BACHATA_RUNTIME
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, 0);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, 0);
+#else
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+#endif
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height);
-    SDL_SetNumberProperty(props, "flags", SDL_WINDOW_VULKAN);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_WINDOW_VULKAN);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
-    // Creating the window directly in fullscreen avoids a visible windowed -> fullscreen
-    // transition on startup. SDL sizes the window to the display and keeps the requested
-    // width/height as the windowed size to restore when leaving fullscreen.
-    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN,
-                           EmulatorSettings.IsFullScreen());
+    LOG_INFO(Input, "Creating SDL Vulkan window");
     window = SDL_CreateWindowWithProperties(props);
+    LOG_INFO(Input, "SDL Vulkan window creation returned");
     SDL_DestroyProperties(props);
     if (window == nullptr) {
         UNREACHABLE_MSG("Failed to create window handle: {}", SDL_GetError());
@@ -136,7 +137,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
 
     bool error = false;
     const SDL_DisplayID displayIndex = SDL_GetDisplayForWindow(window);
-    if (displayIndex == 0) {
+    if (displayIndex < 0) {
         LOG_ERROR(Frontend, "Error getting display index: {}", SDL_GetError());
         error = true;
     }
@@ -151,11 +152,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     }
     SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
     SDL_SyncWindow(window);
-    // The window geometry is only final once the fullscreen transition has settled; refresh
-    // the cached size so the first swapchain and the splashscreen use the real drawable size.
-    SDL_GetWindowSizeInPixels(window, &width, &height);
 
+#ifndef ENABLE_BACHATA_RUNTIME
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+#endif
 
 #if defined(SDL_PLATFORM_WIN32)
     window_info.type = WindowSystemType::Windows;
@@ -183,6 +183,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // input handler init-s
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
+#ifndef ENABLE_BACHATA_RUNTIME
+    controllers.TryOpenSDLControllers();
+#endif
 
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -191,13 +194,39 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
 
 WindowSDL::~WindowSDL() = default;
 
-void WindowSDL::SetIcon(std::span<const u8> png_data) {
-    if (png_data.empty()) {
-        LOG_WARNING(Core, "No window icon data available, using default icon.");
+void WindowSDL::SetIcon(const std::filesystem::path& path) {
+#ifdef ENABLE_BACHATA_RUNTIME
+    // Desktop X11 icons become a megabyte-scale property request. The embedded Android X server
+    // does not need window-manager metadata, and processing it blocks Vulkan WSI negotiation.
+    return;
+#endif
+    if (!std::filesystem::exists(path)) {
+        LOG_WARNING(Core, "Could not find icon file '{}', using default icon.",
+                    fmt::UTF(path.u8string()));
         SetDefaultWindowIcon(window);
         return;
     }
-    SetWindowIcon(window, std::vector<u8>(png_data.begin(), png_data.end()));
+
+    Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read,
+                            Common::FS::FileType::BinaryFile,
+                            Common::FS::FileShareFlag::ShareReadWrite};
+    if (!file.IsOpen()) {
+        LOG_ERROR(Core, "Failed to open window icon file '{}'.", fmt::UTF(path.u8string()));
+        SetDefaultWindowIcon(window);
+        return;
+    }
+
+    const u64 fileSize = file.GetSize();
+    std::vector<u8> buf(fileSize);
+    const size_t bytesRead = file.ReadRaw<u8>(buf.data(), fileSize);
+    file.Close();
+    if (bytesRead < fileSize) {
+        LOG_ERROR(Core, "Failed to read window icon file '{}'.", fmt::UTF(path.u8string()));
+        SetDefaultWindowIcon(window);
+        return;
+    }
+
+    SetWindowIcon(window, buf);
 }
 
 void WindowSDL::WaitEvent() {
@@ -220,8 +249,6 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_MAXIMIZED:
     case SDL_EVENT_WINDOW_RESTORED:
-    case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
-    case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
         OnResize();
         break;
     case SDL_EVENT_WINDOW_MINIMIZED:
@@ -239,7 +266,9 @@ void WindowSDL::WaitEvent() {
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
     case SDL_EVENT_GAMEPAD_REMOVED:
+#ifndef ENABLE_BACHATA_RUNTIME
         controllers.TryOpenSDLControllers();
+#endif
         break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
@@ -278,9 +307,6 @@ void WindowSDL::WaitEvent() {
         break;
     case SDL_EVENT_TOGGLE_SIMPLE_FPS:
         Overlay::ToggleSimpleFps();
-        break;
-    case SDL_EVENT_TOGGLE_FRIENDS:
-        ImGui::Friends::Toggle();
         break;
     case SDL_EVENT_RELOAD_INPUTS:
         Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));

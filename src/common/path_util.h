@@ -26,7 +26,6 @@ enum class PathType {
     CustomConfigs,   // Where custom files for different games are stored.
     CacheDir,        // Where pipeline and shader cache is stored.
     FontsDir,        // Where dumped system fonts are stored.
-    TrophyDir,       // Where general trophy metadata is stored.
     HomeDir,         // PS4 home directory
     CustomModulesDir // Where custom modules are stored.
 };
@@ -49,7 +48,6 @@ constexpr auto CUSTOM_TROPHY = "custom_trophy";
 constexpr auto CUSTOM_CONFIGS = "custom_configs";
 constexpr auto CACHE_DIR = "cache";
 constexpr auto FONTS_DIR = "fonts";
-constexpr auto TROPHY_DIR = "trophy";
 constexpr auto HOME_DIR = "home";
 constexpr auto CUSTOM_MODULES_DIR = "custom_modules";
 
@@ -106,15 +104,14 @@ constexpr auto LOG_FILE = "shad_log.txt";
 void SetUserPath(PathType user_path, const std::filesystem::path& new_path);
 
 /**
- * Recursively searches for an installed game by its ID.
+ * Recursively searches for a game directory by its ID.
  * Limits search depth to prevent excessive filesystem traversal.
  *
  * @param dir Base directory to start the search from
  * @param game_id The game ID to search for
  * @param max_depth Maximum directory depth to search
  *
- * @returns A path to eboot.bin for an unpacked game, or the ".zar" archive itself for a
- *          packed one. std::nullopt if the game isn't found.
+ * @returns Path to eboot.bin if found, std::nullopt otherwise
  */
 [[nodiscard]] std::optional<std::filesystem::path> FindGameByID(const std::filesystem::path& dir,
                                                                 const std::string& game_id,

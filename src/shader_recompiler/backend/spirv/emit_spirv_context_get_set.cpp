@@ -128,33 +128,15 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
         return ctx.OpLoad(ctx.F32[1],
                           ctx.OpAccessChain(ctx.input_f32, ctx.tess_coord, ctx.ConstU32(1U)));
     case IR::Attribute::BaryCoordSmooth:
-        if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
-            return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth,
-                                                            ctx.ConstU32(comp)));
-        } else {
-            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
-        }
+        return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth,
+                                                        ctx.ConstU32(comp)));
     case IR::Attribute::BaryCoordSmoothCentroid:
-        if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
-            return ctx.OpLoad(ctx.F32[1],
-                              ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_centroid,
-                                                ctx.ConstU32(comp)));
-        } else {
-            return ctx.OpCompositeExtract(
-                ctx.F32[1], ctx.OpInterpolateAtCentroid(ctx.F32[3], ctx.bary_coord), comp);
-        }
+        return ctx.OpLoad(
+            ctx.F32[1],
+            ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_centroid, ctx.ConstU32(comp)));
     case IR::Attribute::BaryCoordSmoothSample:
-        if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
-            return ctx.OpLoad(
-                ctx.F32[1],
-                ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_sample, ctx.ConstU32(comp)));
-        } else {
-            return ctx.OpCompositeExtract(
-                ctx.F32[1],
-                ctx.OpInterpolateAtSample(ctx.F32[3], ctx.bary_coord,
-                                          ctx.OpLoad(ctx.U32[1], ctx.sample_index)),
-                comp);
-        }
+        return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_sample,
+                                                        ctx.ConstU32(comp)));
     case IR::Attribute::BaryCoordNoPersp:
         return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp,
                                                         ctx.ConstU32(comp)));
@@ -257,9 +239,15 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
         return op_store(
             ctx.OpAccessChain(ctx.output_f32, ctx.output_position, ctx.ConstU32(element)));
     case IR::Attribute::ClipDistance:
+        if (!Sirit::ValidId(ctx.clip_distances) || element >= ctx.clip_distance_count) {
+            return;
+        }
         return op_store(
             ctx.OpAccessChain(ctx.output_f32, ctx.clip_distances, ctx.ConstU32(element)));
     case IR::Attribute::CullDistance:
+        if (!Sirit::ValidId(ctx.cull_distances) || element >= ctx.cull_distance_count) {
+            return;
+        }
         return op_store(
             ctx.OpAccessChain(ctx.output_f32, ctx.cull_distances, ctx.ConstU32(element)));
     case IR::Attribute::PointSize:
@@ -362,6 +350,18 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     return result;
 }
 
+template <u32 N>
+static Id EmitLoadBufferF32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if (ctx.profile.needs_bit_preserving_buffer0_loads && handle == 0) {
+        const auto [u32_id, u32_ptr] = ctx.buffers[handle].Alias(PointerType::U32);
+        if (Sirit::ValidId(u32_id)) {
+            const Id raw = EmitLoadBufferB32xN<N, PointerType::U32>(ctx, inst, handle, address);
+            return ctx.OpBitcast(ctx.F32[N], raw);
+        }
+    }
+    return EmitLoadBufferB32xN<N, PointerType::F32>(ctx, inst, handle, address);
+}
+
 Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
@@ -412,19 +412,19 @@ Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
 }
 
 Id EmitLoadBufferF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return EmitLoadBufferB32xN<1, PointerType::F32>(ctx, inst, handle, address);
+    return EmitLoadBufferF32xN<1>(ctx, inst, handle, address);
 }
 
 Id EmitLoadBufferF32x2(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return EmitLoadBufferB32xN<2, PointerType::F32>(ctx, inst, handle, address);
+    return EmitLoadBufferF32xN<2>(ctx, inst, handle, address);
 }
 
 Id EmitLoadBufferF32x3(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return EmitLoadBufferB32xN<3, PointerType::F32>(ctx, inst, handle, address);
+    return EmitLoadBufferF32xN<3>(ctx, inst, handle, address);
 }
 
 Id EmitLoadBufferF32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return EmitLoadBufferB32xN<4, PointerType::F32>(ctx, inst, handle, address);
+    return EmitLoadBufferF32xN<4>(ctx, inst, handle, address);
 }
 
 Id EmitLoadBufferFormatF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
@@ -539,27 +539,11 @@ void EmitSetVectorRegister(EmitContext& ctx) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
-void EmitSetVirtualRegister(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
-}
-
-void EmitGetVirtualRegister(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
-}
-
 void EmitSetGotoVariable(EmitContext&) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
 void EmitGetGotoVariable(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
-}
-
-void EmitSetMaskLaneVariable(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
-}
-
-void EmitGetMaskLaneVariable(EmitContext&) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 

@@ -78,6 +78,8 @@ public:
     vk::ImageCreateInfo image_ci{};
 };
 
+constexpr Common::SlotId NULL_IMAGE_ID{0};
+
 class BlitHelper;
 
 struct Image {

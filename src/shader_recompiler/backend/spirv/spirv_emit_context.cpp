@@ -3,7 +3,9 @@
 
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/clip_cull.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -12,6 +14,7 @@
 #include <fmt/format.h>
 
 #include <numbers>
+#include <span>
 #include <string_view>
 
 namespace Shader::Backend::SPIRV {
@@ -356,8 +359,8 @@ void EmitContext::DefineInputs() {
             if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_smooth = DefineVariable(F32[2], spv::BuiltIn::BaryCoordSmoothAMD,
                                                    spv::StorageClass::Input);
-            } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
-                bary_coord =
+            } else if (profile.supports_fragment_shader_barycentric) {
+                bary_coord_smooth =
                     DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
             }
         }
@@ -365,24 +368,20 @@ void EmitContext::DefineInputs() {
             if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_smooth_centroid = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordSmoothCentroidAMD, spv::StorageClass::Input);
-            } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
-                bary_coord =
+            } else if (profile.supports_fragment_shader_barycentric) {
+                bary_coord_smooth_centroid =
                     DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
+                // Decorate(bary_coord_smooth_centroid, spv::Decoration::Centroid);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample)) {
             if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_smooth_sample = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordSmoothSampleAMD, spv::StorageClass::Input);
-            } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
-                bary_coord =
+            } else if (profile.supports_fragment_shader_barycentric) {
+                bary_coord_smooth_sample =
                     DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
-                // we would need sample_index to interpolate the bary_coord later
-                if (!ValidId(sample_index)) {
-                    sample_index =
-                        DefineVariable(U32[1], spv::BuiltIn::SampleId, spv::StorageClass::Input);
-                    Decorate(sample_index, spv::Decoration::Flat);
-                }
+                // Decorate(bary_coord_smooth_sample, spv::Decoration::Sample);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordNoPersp)) {
@@ -547,24 +546,35 @@ void EmitContext::DefineInputs() {
 }
 
 void EmitContext::DefineVertexBlock() {
-    const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
-                                 f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
     const bool needs_clip_distance_emulation = l_stage == LogicalStage::Vertex &&
                                                stage == Stage::Vertex &&
                                                profile.needs_clip_distance_emulation;
-    const auto has_clip_distance_outputs = info.stores.GetAny(IR::Attribute::ClipDistance);
-    if (has_clip_distance_outputs && !needs_clip_distance_emulation) {
-        const Id type{TypeArray(F32[1], ConstU32(8U))};
-        const Id initializer{ConstantComposite(type, zero)};
-        clip_distances = DefineVariable(type, spv::BuiltIn::ClipDistance, spv::StorageClass::Output,
-                                        initializer);
+    const u32 used_clip = info.stores.UsedCount(IR::Attribute::ClipDistance);
+    const u32 used_cull = info.stores.UsedCount(IR::Attribute::CullDistance);
+    const auto arrays = SelectClipCullArrays(
+        used_clip, used_cull, profile.max_clip_distances, profile.max_cull_distances,
+        profile.max_combined_clip_and_cull_distances, used_clip != 0 && !needs_clip_distance_emulation,
+        used_cull != 0 && profile.supports_shader_cull_distance);
+    clip_distance_count = arrays.clip_size;
+    cull_distance_count = arrays.cull_size;
+    if (arrays.clip_size < used_clip || arrays.cull_size < used_cull) {
+        LOG_WARNING(Render_Recompiler,
+                    "Clamped clip/cull arrays used={}/{} emitted={}/{} combined_limit={}", used_clip,
+                    used_cull, arrays.clip_size, arrays.cull_size,
+                    profile.max_combined_clip_and_cull_distances);
     }
-    if (info.stores.GetAny(IR::Attribute::CullDistance)) {
-        const Id type{TypeArray(F32[1], ConstU32(8U))};
-        const Id initializer{ConstantComposite(type, zero)};
-        cull_distances = DefineVariable(type, spv::BuiltIn::CullDistance, spv::StorageClass::Output,
-                                        initializer);
+    const auto define_distance_array = [&](u32 size, spv::BuiltIn builtin) {
+        const Id type{TypeArray(F32[1], ConstU32(size))};
+        boost::container::static_vector<Id, 8> zeros(size, f32_zero_value);
+        const Id initializer{ConstantComposite(type, std::span<const Id>(zeros.data(), zeros.size()))};
+        return DefineVariable(type, builtin, spv::StorageClass::Output, initializer);
+    };
+    if (arrays.clip_size != 0) {
+        clip_distances = define_distance_array(arrays.clip_size, spv::BuiltIn::ClipDistance);
+    }
+    if (arrays.cull_size != 0) {
+        cull_distances = define_distance_array(arrays.cull_size, spv::BuiltIn::CullDistance);
     }
     if (info.stores.GetAny(IR::Attribute::PointSize)) {
         output_point_size =
@@ -759,10 +769,12 @@ void EmitContext::DefinePushDataBlock() {
     interfaces.push_back(push_data_block);
 }
 
-EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, u32 elem_shift,
+EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_storage, bool is_written, u32 elem_shift,
                                                  BufferType buffer_type, Id data_type) {
     // Define array type.
-    const Id record_array_type{TypeRuntimeArray(data_type)};
+    const Id max_num_items = ConstU32(u32(profile.max_ubo_size) >> elem_shift);
+    const Id record_array_type{is_storage ? TypeRuntimeArray(data_type)
+                                          : TypeArray(data_type, max_num_items)};
     // Define block struct type. Don't perform decorations twice on the same Id.
     const Id struct_type{TypeStruct(record_array_type)};
     if (std::ranges::find(buf_type_ids, record_array_type.value, &Id::value) ==
@@ -774,13 +786,14 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, u32 elem_shift
         buf_type_ids.push_back(record_array_type);
     }
     // Define buffer binding interface.
-    constexpr auto storage_class = spv::StorageClass::StorageBuffer;
+    const auto storage_class =
+        is_storage ? spv::StorageClass::StorageBuffer : spv::StorageClass::Uniform;
     const Id struct_pointer_type{TypePointer(storage_class, struct_type)};
     const Id pointer_type = TypePointer(storage_class, data_type);
     const Id id{AddGlobalVariable(struct_pointer_type, storage_class)};
     Decorate(id, spv::Decoration::Binding, binding.unified);
     Decorate(id, spv::Decoration::DescriptorSet, 0U);
-    if (!is_written) {
+    if (is_storage && !is_written) {
         Decorate(id, spv::Decoration::NonWritable);
     }
     switch (buffer_type) {
@@ -789,9 +802,6 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, u32 elem_shift
         break;
     case BufferType::Flatbuf:
         Name(id, "srt_flatbuf");
-        break;
-    case BufferType::ClipPlanes:
-        Name(id, "clip_planes");
         break;
     case BufferType::BdaPagetable:
         Name(id, "bda_pagetable");
@@ -803,7 +813,7 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, u32 elem_shift
         Name(id, "ssbo_shmem");
         break;
     default:
-        Name(id, fmt::format("ssbo_{}", binding.buffer));
+        Name(id, fmt::format("{}_{}", is_storage ? "ssbo" : "ubo", binding.buffer));
         break;
     }
     interfaces.push_back(id);
@@ -813,6 +823,7 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, u32 elem_shift
 void EmitContext::DefineBuffers() {
     for (const auto& desc : info.buffers) {
         const auto buf_sharp = desc.GetSharp(info);
+        const bool is_storage = desc.IsStorage(buf_sharp);
 
         // Set indexes for special buffers.
         if (desc.buffer_type == BufferType::Flatbuf) {
@@ -827,23 +838,26 @@ void EmitContext::DefineBuffers() {
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
-                DefineBuffer(desc.is_written, 3, desc.buffer_type, U64);
+                DefineBuffer(is_storage, desc.is_written, 3, desc.buffer_type, U64);
         }
-        if (True(desc.used_types & IR::Type::U32)) {
+        const bool force_buffer0_u32_alias =
+            profile.needs_bit_preserving_buffer0_loads && buffers.size() == 1 &&
+            True(desc.used_types & IR::Type::F32);
+        if (True(desc.used_types & IR::Type::U32) || force_buffer0_u32_alias) {
             spv_buffer.Alias(PointerType::U32) =
-                DefineBuffer(desc.is_written, 2, desc.buffer_type, U32[1]);
+                DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, U32[1]);
         }
         if (True(desc.used_types & IR::Type::F32)) {
             spv_buffer.Alias(PointerType::F32) =
-                DefineBuffer(desc.is_written, 2, desc.buffer_type, F32[1]);
+                DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, F32[1]);
         }
         if (True(desc.used_types & IR::Type::U16)) {
             spv_buffer.Alias(PointerType::U16) =
-                DefineBuffer(desc.is_written, 1, desc.buffer_type, U16);
+                DefineBuffer(is_storage, desc.is_written, 1, desc.buffer_type, U16);
         }
         if (True(desc.used_types & IR::Type::U8)) {
             spv_buffer.Alias(PointerType::U8) =
-                DefineBuffer(desc.is_written, 0, desc.buffer_type, U8);
+                DefineBuffer(is_storage, desc.is_written, 0, desc.buffer_type, U8);
         }
         ++binding.unified;
     }
@@ -929,7 +943,7 @@ spv::ImageFormat GetFormat(const AmdGpu::Image& image) {
 Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto image = desc.GetSharp(ctx.info);
     const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
-    const auto type = image.GetViewType(desc.is_array);
+    const auto type = desc.GetHostViewType(image);
     const u32 sampled = desc.is_written ? 2 : 1;
     switch (type) {
     case AmdGpu::ImageType::Color1D:
@@ -956,6 +970,7 @@ void EmitContext::DefineImagesAndSamplers() {
         const auto nfmt = sharp.GetNumberFmt();
         const bool is_integer = AmdGpu::IsInteger(nfmt);
         const bool is_storage = image_desc.is_written;
+        const bool is_1d_hosted_as_2d = image_desc.Is1DHostedAs2D(sharp);
         const MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const VectorIds& data_types = GetAttributeType(*this, nfmt);
         const Id sampled_type = data_types[1];
@@ -980,6 +995,7 @@ void EmitContext::DefineImagesAndSamplers() {
             .sampled_type = is_storage ? sampled_type : TypeSampledImage(image_type),
             .image_type = image_type,
             .view_type = sharp.GetViewType(image_desc.is_array),
+            .is_1d_hosted_as_2d = is_1d_hosted_as_2d,
             .is_integer = is_integer,
             .is_storage = is_storage,
             .mip_fallback_mode = mip_fallback_mode,

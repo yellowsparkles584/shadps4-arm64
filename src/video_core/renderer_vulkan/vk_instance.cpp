@@ -10,6 +10,7 @@
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/legacy_vertex_attributes.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -164,9 +165,13 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
     CreateDevice();
+    std::fprintf(stderr, "BACHATA_INSTANCE_DEVICE_READY\n");
     CollectPhysicalMemoryInfo();
+    std::fprintf(stderr, "BACHATA_INSTANCE_MEMORY_READY\n");
     CollectImageFormatInfo();
+    std::fprintf(stderr, "BACHATA_INSTANCE_FORMATS_READY\n");
     CollectToolingInfo();
+    std::fprintf(stderr, "BACHATA_INSTANCE_READY\n");
 }
 
 Instance::~Instance() {
@@ -205,6 +210,11 @@ bool Instance::CreateDevice() {
                           vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
                           vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT>();
     features = feature_chain.get().features;
+    LOG_INFO(Render_Vulkan, "GPU_ClipCull: clip={} cull={} combined={} featClip={} featCull={}",
+             properties.limits.maxClipDistances, properties.limits.maxCullDistances,
+             properties.limits.maxCombinedClipAndCullDistances,
+             static_cast<bool>(features.shaderClipDistance),
+             static_cast<bool>(features.shaderCullDistance));
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
         vk::PhysicalDeviceProperties2, vk::PhysicalDeviceVulkan11Properties,
@@ -240,21 +250,14 @@ bool Instance::CreateDevice() {
     // Required
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-    ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    ASSERT_MSG(add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}",
-               VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
-    ASSERT_MSG(add_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}", VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
-
-    const auto robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
-    ASSERT_MSG(robustness2_features.robustBufferAccess2,
-               "Required Vulkan feature unavailable: robustBufferAccess2");
-    ASSERT_MSG(robustness2_features.robustImageAccess2,
-               "Required Vulkan feature unavailable: robustImageAccess2");
-    ASSERT_MSG(robustness2_features.nullDescriptor,
-               "Required Vulkan feature unavailable: nullDescriptor");
+    // VK_KHR_push_descriptor is optional on Mali/Immortalis drivers. When unavailable,
+    // push_descriptor_props stays zero-initialized (MaxPushDescriptors()==0) and all
+    // descriptor-set layouts fall back to the non-push path with a DescriptorHeap.
+    push_descriptor = add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    // VK_EXT_vertex_attribute_divisor is also optional. When unavailable, instanced
+    // (step-rate) vertex fetch silently degrades to per-vertex (divisor=1). Per-vertex
+    // attributes are unaffected. Mali/Immortalis drivers do not expose this extension.
+    vertex_attribute_divisor = add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
 
     // Optional
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
@@ -275,6 +278,15 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- extendedDynamicState3ColorWriteMask: {}",
                  dynamic_state_3_features.extendedDynamicState3ColorWriteMask);
     }
+    robustness2 = add_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    if (robustness2) {
+        robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
+        LOG_INFO(Render_Vulkan, "- robustBufferAccess2: {}",
+                 robustness2_features.robustBufferAccess2);
+        LOG_INFO(Render_Vulkan, "- robustImageAccess2: {}",
+                 robustness2_features.robustImageAccess2);
+        LOG_INFO(Render_Vulkan, "- nullDescriptor: {}", robustness2_features.nullDescriptor);
+    }
     custom_border_color = add_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
@@ -293,6 +305,15 @@ bool Instance::CreateDevice() {
     if (!amd_shader_explicit_vertex_parameter) {
         fragment_shader_barycentric =
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+    }
+    if (ShouldDisableLegacyVertexAttributes(properties.deviceName)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Disabling VK_EXT_legacy_vertex_attributes on {} so integer "
+                    "vertex attributes use shader NumberClass conversion",
+                    GetModelName());
+        legacy_vertex_attributes = false;
+    } else {
+        legacy_vertex_attributes = add_extension(VK_EXT_LEGACY_VERTEX_ATTRIBUTES_EXTENSION_NAME);
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
@@ -334,7 +355,6 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- sampler2DViewOf3D: {}",
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
-    image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
@@ -400,6 +420,7 @@ bool Instance::CreateDevice() {
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
                 .shaderClipDistance = features.shaderClipDistance,
+                .shaderCullDistance = features.shaderCullDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
                 .shaderInt16 = features.shaderInt16,
@@ -407,12 +428,14 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceVulkan11Features{
             .storageBuffer16BitAccess = vk11_features.storageBuffer16BitAccess,
+            .uniformAndStorageBuffer16BitAccess = vk11_features.uniformAndStorageBuffer16BitAccess,
             .shaderDrawParameters = vk11_features.shaderDrawParameters,
         },
         vk::PhysicalDeviceVulkan12Features{
             .samplerMirrorClampToEdge = vk12_features.samplerMirrorClampToEdge,
             .drawIndirectCount = vk12_features.drawIndirectCount,
             .storageBuffer8BitAccess = vk12_features.storageBuffer8BitAccess,
+            .uniformAndStorageBuffer8BitAccess = vk12_features.uniformAndStorageBuffer8BitAccess,
             .shaderBufferInt64Atomics = vk12_features.shaderBufferInt64Atomics,
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
@@ -449,9 +472,9 @@ bool Instance::CreateDevice() {
             .depthClipEnable = true,
         },
         vk::PhysicalDeviceRobustness2FeaturesEXT{
-            .robustBufferAccess2 = true,
-            .robustImageAccess2 = true,
-            .nullDescriptor = true,
+            .robustBufferAccess2 = robustness2_features.robustBufferAccess2,
+            .robustImageAccess2 = robustness2_features.robustImageAccess2,
+            .nullDescriptor = robustness2_features.nullDescriptor,
         },
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
             .vertexInputDynamicState = true,
@@ -463,6 +486,9 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR{
             .fragmentShaderBarycentric = true,
+        },
+        vk::PhysicalDeviceLegacyVertexAttributesFeaturesEXT{
+            .legacyVertexAttributes = true,
         },
         vk::PhysicalDeviceProvokingVertexFeaturesEXT{
             .provokingVertexLast = true,
@@ -498,9 +524,6 @@ bool Instance::CreateDevice() {
             .image2DViewOf3D = image_2d_view_of_3d_features.image2DViewOf3D,
             .sampler2DViewOf3D = image_2d_view_of_3d_features.sampler2DViewOf3D,
         },
-        vk::PhysicalDeviceImageViewMinLodFeaturesEXT{
-            .minLod = true,
-        },
     };
 
     if (!custom_border_color) {
@@ -515,6 +538,9 @@ bool Instance::CreateDevice() {
     if (!depth_clip_enable) {
         device_chain.unlink<vk::PhysicalDeviceDepthClipEnableFeaturesEXT>();
     }
+    if (!robustness2) {
+        device_chain.unlink<vk::PhysicalDeviceRobustness2FeaturesEXT>();
+    }
     if (!vertex_input_dynamic_state) {
         device_chain.unlink<vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT>();
     }
@@ -524,8 +550,14 @@ bool Instance::CreateDevice() {
     if (!fragment_shader_barycentric) {
         device_chain.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
     }
+    if (!legacy_vertex_attributes) {
+        device_chain.unlink<vk::PhysicalDeviceLegacyVertexAttributesFeaturesEXT>();
+    }
     if (!provoking_vertex) {
         device_chain.unlink<vk::PhysicalDeviceProvokingVertexFeaturesEXT>();
+    }
+    if (!vertex_attribute_divisor) {
+        device_chain.unlink<vk::PhysicalDeviceVertexAttributeDivisorFeatures>();
     }
     if (!maintenance_8) {
         device_chain.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();
@@ -543,9 +575,6 @@ bool Instance::CreateDevice() {
     if (!image_2d_view_of_3d) {
         device_chain.unlink<vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT>();
     }
-    if (!image_view_min_lod) {
-        device_chain.unlink<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>();
-    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -555,6 +584,67 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+
+
+    // ── Vulkan 1.3 dispatch audit ─────────────────────────────────────────────
+    // Run immediately after init(*device) so failures surface at startup, not at
+    // the first draw call.  If any mandatory slot is null the renderer cannot
+    // proceed; log every slot so the complete state is captured in one message.
+#ifndef NDEBUG
+    {
+        struct SlotCheck {
+            const char* name;
+            const void* slot;  // address stored in the dispatcher
+            bool required;
+        };
+        auto gdpa = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+        VkDevice raw_device = static_cast<VkDevice>(*device);
+
+        // Probe each function via GDPA so we can compare direct vs. Vulkan-Hpp slot.
+#define PROBE(fn)                                                            \
+        {                                                                    \
+            #fn,                                                             \
+            reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.fn),\
+            true                                                             \
+        }
+        const SlotCheck checks[] = {
+            PROBE(vkCmdBindVertexBuffers2),
+            PROBE(vkCmdPipelineBarrier2),
+            PROBE(vkQueueSubmit2),
+            PROBE(vkCmdBeginRendering),
+            PROBE(vkCmdEndRendering),
+            PROBE(vkCmdCopyBuffer2),
+            PROBE(vkCmdCopyImage2),
+            PROBE(vkCmdCopyBufferToImage2),
+            PROBE(vkCmdCopyImageToBuffer2),
+            PROBE(vkCmdBlitImage2),
+            PROBE(vkCmdResolveImage2),
+            PROBE(vkGetBufferDeviceAddress),
+        };
+#undef PROBE
+
+        bool any_null = false;
+        LOG_INFO(Render_Vulkan,
+                 "VK-HPP dispatch audit: dispatcher={} device={}",
+                 fmt::ptr(&VULKAN_HPP_DEFAULT_DISPATCHER),
+                 fmt::ptr(raw_device));
+        for (const auto& c : checks) {
+            auto direct = gdpa ? gdpa(raw_device, c.name) : nullptr;
+            LOG_INFO(Render_Vulkan,
+                     "  {:40s} hpp={} direct={}{}",
+                     c.name,
+                     fmt::ptr(c.slot),
+                     fmt::ptr(direct),
+                     (c.required && !c.slot) ? " <-- NULL MANDATORY SLOT" : "");
+            if (c.required && !c.slot)
+                any_null = true;
+        }
+        ASSERT_MSG(!any_null,
+                   "One or more mandatory Vulkan 1.3 dispatcher slots are null "
+                   "immediately after init(*device). Renderer cannot start.");
+    }
+#endif
+
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
@@ -698,6 +788,12 @@ void Instance::CollectImageFormatInfo() {
     LOG_INFO(Render_Vulkan, "Block Texel View support: {}",
              supports_block_texel_view ? "Yes" : "No");
 
+#ifdef ENABLE_BACHATA_RUNTIME
+    // Remaining checks only produce diagnostics. Some Turnip format-property paths block when
+    // reached through Box64, while format support is already cached for renderer decisions.
+    return;
+#endif
+
     // Check and log format support details.
     for (const auto& format : LiverpoolToVK::SurfaceFormats()) {
         if (!IsFormatSupported(format.vk_format, format.flags)) {
@@ -722,6 +818,11 @@ void Instance::CollectImageFormatInfo() {
 }
 
 void Instance::CollectToolingInfo() const {
+#ifdef ENABLE_BACHATA_RUNTIME
+    // Turnip's tool-properties query can block indefinitely through Box64. Tool metadata is
+    // diagnostic-only and is not required for device creation or rendering.
+    return;
+#endif
     if (driver_id == vk::DriverId::eAmdProprietary ||
         driver_id == vk::DriverId::eIntelProprietaryWindows) {
         // AMD: Causes issues with Reshade.

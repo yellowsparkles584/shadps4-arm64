@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/frontend/control_flow_graph.h"
@@ -253,6 +253,7 @@ public:
         buffer.used_types |= desc.used_types;
         buffer.is_written |= desc.is_written;
         buffer.is_formatted |= desc.is_formatted;
+        buffer.used_as_readconst |= desc.used_as_readconst;
         return index;
     }
 
@@ -514,6 +515,7 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
             .used_types = BufferDataType(inst, profile, buffer.GetNumberFmt()),
             .inline_cbuf = buffer,
             .buffer_type = BufferType::Guest,
+            .used_as_readconst = inst.GetOpcode() == IR::Opcode::ReadConstBuffer,
         });
     } else {
         // Normal buffer resource.
@@ -528,6 +530,7 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
             .is_written = IsBufferStore(inst),
             .is_formatted = inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 ||
                             inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32,
+            .used_as_readconst = inst.GetOpcode() == IR::Opcode::ReadConstBuffer,
         });
     }
 
@@ -611,8 +614,8 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
             inst.ReplaceUsesWith(ir.Imm32(1));
             return;
         case IR::Opcode::ImageQueryDimensions: {
-            IR::Value dims = ir.CompositeConstruct(ir.Imm32(static_cast<u32>(image.width)),  // x
-                                                   ir.Imm32(static_cast<u32>(image.height)), // y
+            IR::Value dims = ir.CompositeConstruct(ir.Imm32(static_cast<u32>(image.width)), // x
+                                                   ir.Imm32(static_cast<u32>(image.width)), // y
                                                    ir.Imm32(1), ir.Imm32(1)); // depth, mip
             inst.ReplaceUsesWith(dims);
 
@@ -677,9 +680,35 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
 
     // For data append/consume operations attempt to deduce the GDS address.
     if (inst.GetOpcode() == IR::Opcode::DataAppend || inst.GetOpcode() == IR::Opcode::DataConsume) {
+        const auto pred = [](const IR::Inst* inst) -> std::optional<const IR::Inst*> {
+            if (inst->GetOpcode() == IR::Opcode::GetUserData) {
+                return inst;
+            }
+            return std::nullopt;
+        };
+
+        u32 gds_addr = 0;
+        const IR::Value& gds_offset = inst.Arg(0);
+        if (gds_offset.IsImmediate()) {
+            // Nothing to do, offset is known.
+            gds_addr = gds_offset.U32() & 0xFFFF;
+        } else {
+            const auto result = IR::BreadthFirstSearch(&inst, pred);
+            ASSERT_MSG(result, "Unable to track M0 source");
+
+            // M0 must be set by some user data register.
+            const IR::Inst* prod = gds_offset.InstRecursive();
+            const u32 ud_reg = u32(result.value()->Arg(0).ScalarReg());
+            u32 m0_val = info.user_data[ud_reg] >> 16;
+            if (prod->GetOpcode() == IR::Opcode::IAdd32) {
+                m0_val += prod->Arg(1).U32();
+            }
+            gds_addr = m0_val & 0xFFFF;
+        }
+
         // Patch instruction to GDS buffer atomic increment/decrement.
         const IR::U32 handle = ir.Imm32(binding);
-        const IR::U32 index = ir.ShiftRightLogical(IR::U32{inst.Arg(0)}, ir.Imm32(2));
+        const IR::U32 index = ir.Imm32(gds_addr >> 2);
         const bool is_append = inst.GetOpcode() == IR::Opcode::DataAppend;
         const IR::Value prev = is_append ? ir.BufferAtomicInc(handle, index, {})
                                          : ir.BufferAtomicDec(handle, index, {});
@@ -867,9 +896,7 @@ IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR:
     // to convert this to the range [0.0, 1.0] to get correct results.
     const auto fixed_x = ir.FPSub(IR::F32{x}, ir.Imm32(1.f));
     const auto fixed_y = ir.FPSub(IR::F32{y}, ir.Imm32(1.f));
-    const auto fixed_face =
-        ir.FPFma(ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(8.f))), ir.Imm32(-2.f), IR::F32{face});
-    return ir.CompositeConstruct(fixed_x, fixed_y, fixed_face);
+    return ir.CompositeConstruct(fixed_x, fixed_y, face);
 }
 
 void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
@@ -881,6 +908,7 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type = image.GetViewType(image_res.is_array);
+    const bool is_1d_hosted_as_2d = image_res.Is1DHostedAs2D(image);
 
     IR::Inst* body1 = inst.Arg(2).InstRecursive();
     IR::Inst* body2 = inst.Arg(3).InstRecursive();
@@ -929,6 +957,10 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
 
         switch (view_type) {
         case AmdGpu::ImageType::Color1D:
+            return is_1d_hosted_as_2d
+                       ? ir.CompositeConstruct(read(0),
+                                               ir.Imm32(ImageResource::Hosted2DIntegerY))
+                       : IR::Value{read(0)};
         case AmdGpu::ImageType::Color1DArray:
             return read(0);
         case AmdGpu::ImageType::Color2D:
@@ -948,7 +980,17 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
             return {};
         }
         switch (view_type) {
-        case AmdGpu::ImageType::Color1D:
+        case AmdGpu::ImageType::Color1D: {
+            // du/dx, du/dy
+            addr_reg = addr_reg + 2;
+            if (is_1d_hosted_as_2d) {
+                return {
+                    ir.CompositeConstruct(get_addr_reg(addr_reg - 2), ir.Imm32(0.0f)),
+                    ir.CompositeConstruct(get_addr_reg(addr_reg - 1), ir.Imm32(0.0f)),
+                };
+            }
+            return {get_addr_reg(addr_reg - 2), get_addr_reg(addr_reg - 1)};
+        }
         case AmdGpu::ImageType::Color1DArray:
             // du/dx, du/dy
             addr_reg = addr_reg + 2;
@@ -1005,7 +1047,10 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
         switch (view_type) {
         case AmdGpu::ImageType::Color1D: // x
             addr_reg = addr_reg + 1;
-            return get_coord(addr_reg - 1, 0);
+            return is_1d_hosted_as_2d
+                       ? ir.CompositeConstruct(get_coord(addr_reg - 1, 0),
+                                               ir.Imm32(ImageResource::Hosted2DSampleY))
+                       : get_coord(addr_reg - 1, 0);
         case AmdGpu::ImageType::Color1DArray: // x, slice
         case AmdGpu::ImageType::Color2D:      // x, y
         case AmdGpu::ImageType::Color2DMsaa:  // x, y
@@ -1084,12 +1129,20 @@ void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type = image.GetViewType(image_res.is_array);
+    const bool is_1d_hosted_as_2d = image_res.Is1DHostedAs2D(image);
 
     // Now that we know the image type, adjust texture coordinate vector.
     IR::Inst* body = inst.Arg(1).InstRecursive();
     const auto [coords, arg] = [&] -> std::pair<IR::Value, IR::Value> {
         switch (view_type) {
         case AmdGpu::ImageType::Color1D: // x, [lod]
+            if (is_1d_hosted_as_2d) {
+                const auto host_y =
+                    inst.GetOpcode() == IR::Opcode::ImageQueryLod
+                        ? IR::Value{ir.Imm32(ImageResource::Hosted2DSampleY)}
+                        : IR::Value{ir.Imm32(ImageResource::Hosted2DIntegerY)};
+                return {ir.CompositeConstruct(body->Arg(0), host_y), body->Arg(1)};
+            }
             return {body->Arg(0), body->Arg(1)};
         case AmdGpu::ImageType::Color1DArray: // x, slice, [lod]
         case AmdGpu::ImageType::Color2D:      // x, y, [lod]

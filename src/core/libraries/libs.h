@@ -6,9 +6,25 @@
 #include "core/loader/elf.h"
 #include "core/loader/symbols_resolver.h"
 #include "core/tls.h"
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+#include "core/guest_cpu/hle_call_adapter.h"
+#endif
 
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
 #define LIB_FUNCTION(nid, lib, libversion, mod, function)                                          \
-    do {                                                                                           \
+    {                                                                                              \
+        Core::Loader::SymbolResolver sr{};                                                         \
+        sr.name = nid;                                                                             \
+        sr.library = lib;                                                                          \
+        sr.library_version = libversion;                                                           \
+        sr.module = mod;                                                                           \
+        sr.type = Core::Loader::SymbolType::Function;                                              \
+        /* FEX reaches HLE through an x86 syscall veneer, never an ARM host address. */           \
+        sym->AddFunction(sr, Core::GuestCpu::MakeHleCallAdapter(function));                        \
+    }
+#else
+#define LIB_FUNCTION(nid, lib, libversion, mod, function)                                          \
+    {                                                                                              \
         Core::Loader::SymbolResolver sr{};                                                         \
         sr.name = nid;                                                                             \
         sr.library = lib;                                                                          \
@@ -17,10 +33,11 @@
         sr.type = Core::Loader::SymbolType::Function;                                              \
         auto func = reinterpret_cast<u64>(HOST_CALL(function));                                    \
         sym->AddSymbol(sr, func);                                                                  \
-    } while (0)
+    }
+#endif
 
 #define LIB_OBJ(nid, lib, libversion, mod, obj)                                                    \
-    do {                                                                                           \
+    {                                                                                              \
         Core::Loader::SymbolResolver sr{};                                                         \
         sr.name = nid;                                                                             \
         sr.library = lib;                                                                          \
@@ -28,7 +45,7 @@
         sr.module = mod;                                                                           \
         sr.type = Core::Loader::SymbolType::Object;                                                \
         sym->AddSymbol(sr, reinterpret_cast<u64>(obj));                                            \
-    } while (0)
+    }
 
 namespace Libraries {
 

@@ -13,7 +13,6 @@
 #include "pad.h"
 
 #include <algorithm>
-#include <array>
 #include <optional>
 
 namespace Libraries::Pad {
@@ -42,6 +41,42 @@ static bool g_initialized = false;
 static u64 pad_handle_counter = 1;
 static std::unordered_map<HandleKey, s32, HandleKeyHash> pad_handle_map{};
 static std::unordered_map<s32, GameController*> handle_to_controller_map{};
+
+// SnowRunner title polls scePadReadState with handle 1 and never calls scePadOpen.
+// Desktop SDL discovery opens a handle first; Android only ConnectController().
+static s32 EnsurePadHandle(s32 handle) {
+    if (handle_to_controller_map.find(handle) != handle_to_controller_map.end()) {
+        return handle;
+    }
+    if (handle < 1) {
+        return ORBIS_PAD_ERROR_INVALID_HANDLE;
+    }
+    if (!g_initialized) {
+        g_initialized = true;
+    }
+    const s32 user_id = UserManagement.GetDefaultUser().user_id;
+    LOG_INFO(Lib_Pad, "auto-open missing handle {} for user {}", handle, user_id);
+    auto existing = pad_handle_map.find({user_id, 0, 0});
+    s32 opened = existing != pad_handle_map.end() ? existing->second
+                                                  : scePadOpen(user_id, 0, 0, nullptr);
+    if (opened == ORBIS_PAD_ERROR_ALREADY_OPENED) {
+        existing = pad_handle_map.find({user_id, 0, 0});
+        opened = existing != pad_handle_map.end() ? existing->second : opened;
+    }
+    if (opened < 0) {
+        LOG_WARNING(Lib_Pad, "auto-open failed: {}", opened);
+        return opened;
+    }
+    auto cit = handle_to_controller_map.find(opened);
+    if (cit == handle_to_controller_map.end()) {
+        return ORBIS_PAD_ERROR_INVALID_HANDLE;
+    }
+    if (handle != opened) {
+        handle_to_controller_map[handle] = cit->second;
+        LOG_INFO(Lib_Pad, "aliased handle {} to opened {}", handle, opened);
+    }
+    return handle;
+}
 
 int PS4_SYSV_ABI scePadClose(s32 handle) {
     LOG_WARNING(Lib_Pad, "called, handle: {}", handle);
@@ -134,11 +169,15 @@ int PS4_SYSV_ABI scePadGetCapability() {
 
 int PS4_SYSV_ABI scePadGetControllerInformation(s32 handle, OrbisPadControllerInformation* pInfo) {
     LOG_DEBUG(Lib_Pad, "called handle = {}", handle);
+    handle = EnsurePadHandle(handle);
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
-    const Input::State state = it->second->ReadState();
+    bool connected = false;
+    int connected_count = 0;
+    Input::State state{};
+    it->second->ReadState(&state, &connected, &connected_count);
 
     std::memset(pInfo, 0, sizeof(OrbisPadControllerInformation));
     pInfo->touchPadInfo.pixelDensity = 1;
@@ -147,10 +186,10 @@ int PS4_SYSV_ABI scePadGetControllerInformation(s32 handle, OrbisPadControllerIn
     pInfo->stickInfo.deadZoneLeft = 1;
     pInfo->stickInfo.deadZoneRight = 1;
     pInfo->connectionType = ORBIS_PAD_CONNECTION_TYPE_LOCAL;
-    pInfo->connectedCount = state.connected_count;
+    pInfo->connectedCount = static_cast<u8>(std::clamp(connected_count, 0, 0xff));
     pInfo->deviceClass = OrbisPadDeviceClass::Standard;
-    pInfo->connected = state.connected;
-    if (state.connected) {
+    pInfo->connected = connected;
+    if (connected) {
         pInfo->deviceClass = EmulatorSettings.IsUsingSpecialPad()
                                  ? (OrbisPadDeviceClass)EmulatorSettings.GetSpecialPadClass()
                                  : OrbisPadDeviceClass::Standard;
@@ -195,14 +234,21 @@ int PS4_SYSV_ABI scePadGetFeatureReport() {
 int PS4_SYSV_ABI scePadGetHandle(Libraries::UserService::OrbisUserServiceUserId userId, s32 type,
                                  s32 index) {
     if (!g_initialized) {
-        return ORBIS_PAD_ERROR_NOT_INITIALIZED;
+        LOG_WARNING(Lib_Pad, "scePadGetHandle before scePadInit; enabling pad");
+        g_initialized = true;
     }
     if (userId == -1) {
         return ORBIS_PAD_ERROR_DEVICE_NO_HANDLE;
     }
     auto it = pad_handle_map.find({userId, type, index});
     if (it == pad_handle_map.end()) {
-        return ORBIS_PAD_ERROR_DEVICE_NO_HANDLE;
+        LOG_INFO(Lib_Pad, "GetHandle auto-open user_id={} type={} index={}", userId, type, index);
+        const s32 opened = scePadOpen(userId, type, index, nullptr);
+        if (opened < 0) {
+            LOG_WARNING(Lib_Pad, "GetHandle auto-open failed: {}", opened);
+            return ORBIS_PAD_ERROR_DEVICE_NO_HANDLE;
+        }
+        return opened;
     }
     s32 pad_handle = it->second;
     LOG_DEBUG(Lib_Pad, "called, userid: {}, out pad handle: {}", userId, pad_handle);
@@ -307,8 +353,11 @@ int PS4_SYSV_ABI scePadMbusTerm() {
 
 int PS4_SYSV_ABI scePadOpen(Libraries::UserService::OrbisUserServiceUserId userId, s32 type,
                             s32 index, const OrbisPadOpenParam* pParam) {
+    LOG_INFO(Lib_Pad, "scePadOpen user_id={} type={} index={} initialized={}", userId, type, index,
+             g_initialized);
     if (!g_initialized) {
-        return ORBIS_PAD_ERROR_NOT_INITIALIZED;
+        LOG_WARNING(Lib_Pad, "scePadOpen before scePadInit; enabling pad");
+        g_initialized = true;
     }
     if (userId < 0) {
         return ORBIS_DEVICE_SERVICE_ERROR_INVALID_USER;
@@ -365,8 +414,9 @@ int PS4_SYSV_ABI scePadOutputReport() {
     return ORBIS_OK;
 }
 
-int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
-    if (num > 0 && !states[0].connected) {
+int ProcessStates(s32 handle, OrbisPadData* pData, Input::GameController& controller,
+                  Input::State* states, s32 num, bool connected, u32 connected_count) {
+    if (!connected) {
         pData[0] = {};
         pData[0].orientation = {0.0f, 0.0f, 0.0f, 1.0f};
         pData[0].connected = false;
@@ -375,15 +425,15 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
 
     const bool gamepad_input_intercepted = ImGui::Core::IsGamepadInputCaptured();
     for (int i = 0; i < num; i++) {
-        pData[i] = {};
         if (gamepad_input_intercepted) {
+            pData[i] = {};
             pData[i].buttons = OrbisPadButtonDataOffset::Intercepted;
             pData[i].leftStick = {128, 128};
             pData[i].rightStick = {128, 128};
             pData[i].orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-            pData[i].connected = states[i].connected;
+            pData[i].connected = connected;
             pData[i].timestamp = states[i].time;
-            pData[i].connectedCount = states[i].connected_count;
+            pData[i].connectedCount = connected_count;
             pData[i].deviceUniqueDataLen = 0;
             continue;
         }
@@ -401,9 +451,64 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].angularVelocity.x = states[i].angularVelocity.x;
         pData[i].angularVelocity.y = states[i].angularVelocity.y;
         pData[i].angularVelocity.z = states[i].angularVelocity.z;
-        pData[i].orientation = states[i].orientation;
+        pData[i].orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+
+        const auto gyro_poll_rate = controller.accel_poll_rate;
+        if (gyro_poll_rate != 0.0f) {
+            auto now = std::chrono::steady_clock::now();
+            float deltaTime = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  now - controller.GetLastUpdate())
+                                  .count() /
+                              1000000.0f;
+            controller.SetLastUpdate(now);
+            Libraries::Pad::OrbisFQuaternion lastOrientation = controller.GetLastOrientation();
+            Libraries::Pad::OrbisFQuaternion outputOrientation = {0.0f, 0.0f, 0.0f, 1.0f};
+            GameControllers::CalculateOrientation(pData->acceleration, pData->angularVelocity,
+                                                  deltaTime, lastOrientation, outputOrientation);
+            pData[i].orientation = outputOrientation;
+            controller.SetLastOrientation(outputOrientation);
+        }
         pData[i].touchData.touchNum =
             (states[i].touchpad[0].state ? 1 : 0) + (states[i].touchpad[1].state ? 1 : 0);
+
+        if (handle == 1) {
+            if (controller.GetTouchCount() >= 127) {
+                controller.SetTouchCount(0);
+            }
+
+            if (controller.GetSecondaryTouchCount() >= 127) {
+                controller.SetSecondaryTouchCount(0);
+            }
+
+            if (pData->touchData.touchNum == 1 && controller.GetPreviousTouchNum() == 0) {
+                controller.SetTouchCount(controller.GetTouchCount() + 1);
+                controller.SetSecondaryTouchCount(controller.GetTouchCount());
+            } else if (pData->touchData.touchNum == 2 && controller.GetPreviousTouchNum() == 1) {
+                controller.SetSecondaryTouchCount(controller.GetSecondaryTouchCount() + 1);
+            } else if (pData->touchData.touchNum == 0 && controller.GetPreviousTouchNum() > 0) {
+                if (controller.GetTouchCount() < controller.GetSecondaryTouchCount()) {
+                    controller.SetTouchCount(controller.GetSecondaryTouchCount());
+                } else {
+                    if (controller.WasSecondaryTouchReset()) {
+                        controller.SetTouchCount(controller.GetSecondaryTouchCount());
+                        controller.UnsetSecondaryTouchResetBool();
+                    }
+                }
+            }
+
+            controller.SetPreviousTouchNum(pData->touchData.touchNum);
+
+            if (pData->touchData.touchNum == 1) {
+                states[i].touchpad[0].ID = controller.GetTouchCount();
+                states[i].touchpad[1].ID = 0;
+            } else if (pData->touchData.touchNum == 2) {
+                states[i].touchpad[0].ID = controller.GetTouchCount();
+                states[i].touchpad[1].ID = controller.GetSecondaryTouchCount();
+            }
+        } else {
+            states[i].touchpad[0].ID = 1;
+            states[i].touchpad[1].ID = 2;
+        }
 
         if (!states[i].touchpad[0].state && states[i].touchpad[1].state) {
             pData[i].touchData.touch[0].x = states[i].touchpad[1].x;
@@ -418,11 +523,14 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
             pData[i].touchData.touch[1].id = states[i].touchpad[1].ID;
         }
         if (Common::ElfInfo::Instance().FirmwareVer() > Common::ElfInfo::FW_350) {
-            pData[i].touchData.time_since_touch_held_down = states[i].touch_time_since_held_down;
+            pData[i].touchData.time_since_touch_held_down =
+                controller.last_touch_down_timestamp == 0
+                    ? 0
+                    : states[i].time - controller.last_touch_down_timestamp;
         }
-        pData[i].connected = states[i].connected;
+        pData[i].connected = connected;
         pData[i].timestamp = states[i].time;
-        pData[i].connectedCount = states[i].connected_count;
+        pData[i].connectedCount = connected_count;
         pData[i].deviceUniqueDataLen = 0;
     }
 
@@ -431,17 +539,18 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
 
 int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     LOG_TRACE(Lib_Pad, "called");
-    if (pData == nullptr || num < 1 || num > ORBIS_PAD_MAX_DATA_NUM) {
-        return ORBIS_PAD_ERROR_INVALID_ARG;
-    }
+    handle = EnsurePadHandle(handle);
+    int connected_count = 0;
+    bool connected = false;
+    std::vector<Input::State> states(64);
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
     auto& controller = *it->second;
-    std::array<Input::State, ORBIS_PAD_MAX_DATA_NUM> states;
-    const int ret_num = controller.ReadStates(states.data(), num);
-    return ProcessStates(pData, states.data(), ret_num);
+    int ret_num = controller.ReadStates(states.data(), num, &connected, &connected_count);
+    return ProcessStates(handle, pData, controller, states.data(), ret_num, connected,
+                         connected_count);
 }
 
 int PS4_SYSV_ABI scePadReadBlasterForTracker() {
@@ -465,9 +574,23 @@ int PS4_SYSV_ABI scePadReadHistory() {
 }
 
 int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
-    LOG_TRACE(Lib_Pad, "handle: {}", handle);
-    const int result = scePadRead(handle, pData, 1);
-    return result < 0 ? result : ORBIS_OK;
+    static bool logged_once = false;
+    if (!logged_once) {
+        LOG_INFO(Lib_Pad, "handle: {}", handle);
+        logged_once = true;
+    }
+    handle = EnsurePadHandle(handle);
+    auto it = handle_to_controller_map.find(handle);
+    if (it == handle_to_controller_map.end()) {
+        return ORBIS_PAD_ERROR_INVALID_HANDLE;
+    }
+    auto& controller = *it->second;
+    int connected_count = 0;
+    bool connected = false;
+    Input::State state;
+    controller.ReadState(&state, &connected, &connected_count);
+    ProcessStates(handle, pData, controller, &state, 1, connected, connected_count);
+    return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI scePadReadStateExt() {
@@ -513,7 +636,9 @@ int PS4_SYSV_ABI scePadResetOrientation(s32 handle) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
     auto& controller = *it->second;
-    controller.ResetOrientation();
+    Libraries::Pad::OrbisFQuaternion defaultOrientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    controller.SetLastOrientation(defaultOrientation);
+    controller.SetLastUpdate(std::chrono::steady_clock::now());
 
     return ORBIS_OK;
 }
@@ -744,8 +869,6 @@ int PS4_SYSV_ABI Func_EF103E845B6F0420() {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    Common::Singleton<GameControllers>::Instance()->TryOpenSDLControllers();
-
     LIB_FUNCTION("6ncge5+l5Qs", "libScePad", 1, "libScePad", scePadClose);
     LIB_FUNCTION("kazv1NzSB8c", "libScePad", 1, "libScePad", scePadConnectPort);
     LIB_FUNCTION("AcslpN1jHR8", "libScePad", 1, "libScePad",

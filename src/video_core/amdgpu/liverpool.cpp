@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
+#include <mutex>
+
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -10,15 +14,34 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
+#include "common/logging/log.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/amdgpu/pm4_packet.h"
+#include "video_core/amdgpu/pm4_type0.h"
+#include "video_core/amdgpu/pm4_type1.h"
+#include "video_core/amdgpu/stall_log.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
+
+static void MaybeRecordVideoOutLabelLock(Libraries::VideoOut::VideoOutPort* vo_port, u64* address,
+                                         const void* data, u32 data_size) {
+    if (vo_port == nullptr || address == nullptr || !vo_port->IsVoLabel(address)) {
+        return;
+    }
+    u64 value = 0;
+    std::memcpy(&value, data, std::min<size_t>(data_size, sizeof(value)));
+    if (value != 1) {
+        return;
+    }
+    std::scoped_lock lock{vo_port->port_mutex};
+    vo_port->flip_labels.RecordGpuLock(vo_port->LabelIndex(address));
+}
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -122,7 +145,16 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
+            in_gfx_task.store(true, std::memory_order_relaxed);
             task.resume();
+            in_gfx_task.store(false, std::memory_order_relaxed);
+#ifdef ENABLE_BACHATA_RUNTIME
+            if (++debug_resume_count % 1'000 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "GPU coroutine active resumes={} queue={} opcode={:#x} submits={}",
+                            debug_resume_count, curr_qid, debug_last_opcode, num_submits.load());
+            }
+#endif
 
             if (task.done()) {
                 task.destroy();
@@ -157,12 +189,50 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
         const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
         const u32 type = header->type;
+        if (!Pm4PacketFits(ccb)) {
+            LOG_ERROR(Lib_GnmDriver,
+                      "CE PM4 packet exceeds remaining submission. type={} size={} remaining={}",
+                      type, Pm4PacketDwords(header->raw), ccb.size());
+            break;
+        }
+        if (type == 2) {
+            ccb = NextPacket(ccb, 1);
+            continue;
+        }
+        if (type == 0) {
+            const auto type0 = ConsumePm4Type0(ccb, regs.reg_array);
+            if (!type0.consumed) {
+                LOG_ERROR(Lib_GnmDriver,
+                          "CE PM4 type 0 exceeds remaining submission. size={} remaining={}",
+                          header->type0.NumWords(), ccb.size());
+                break;
+            }
+            LOG_WARNING(Lib_GnmDriver, "CE PM4 type 0 register write base={} size={} written={}",
+                        header->type0.base.Value(), header->type0.NumWords(), type0.words_written);
+            ccb = NextPacket(ccb, type0.packet_dwords);
+            continue;
+        }
+        if (type == 1) {
+            const auto type1 = ConsumePm4Type1(ccb, regs.reg_array);
+            if (!type1.consumed) {
+                LOG_ERROR(Lib_GnmDriver,
+                          "CE PM4 type 1 exceeds remaining submission. remaining={}", ccb.size());
+                break;
+            }
+            LOG_WARNING(Lib_GnmDriver, "CE PM4 type 1 register write a={} b={} written={}",
+                        Pm4Type1RegA(header->raw), Pm4Type1RegB(header->raw), type1.words_written);
+            ccb = NextPacket(ccb, type1.packet_dwords);
+            continue;
+        }
         if (type != 3) {
-            // No other types of packets were spotted so far
-            UNREACHABLE_MSG("Invalid PM4 type {}", type);
+            LOG_ERROR(Lib_GnmDriver, "CE invalid PM4 type {} — skipping remainder", type);
+            break;
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+#ifdef ENABLE_BACHATA_RUNTIME
+        debug_last_opcode = static_cast<u32>(opcode);
+#endif
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -186,14 +256,30 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             break;
         }
         case PM4ItOpcode::WaitOnDeCounterDiff: {
-            const auto diff = it_body[0];
+            const u32 diff = it_body[0];
+            u64 wdecd_iters = 0;
             while ((cblock.de_count - cblock.ce_count) >= diff) {
                 YIELD_CE();
+#ifdef ENABLE_BACHATA_RUNTIME
+                if (ShouldLogStallIteration(++wdecd_iters)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PM4 WAIT_ON_DE_COUNTER_DIFF stalled (CE) iterations={} diff={} "
+                                "ce_count={} de_count={}",
+                                wdecd_iters, diff, cblock.ce_count, cblock.de_count);
+                }
+#endif
             }
             break;
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            if (!Pm4IndirectBufferUsable(indirect_buffer->Address<const u32>(),
+                                         indirect_buffer->ib_size)) {
+                LOG_ERROR(Lib_GnmDriver, "CE IT_INDIRECT_BUFFER_CONST skipped: addr={} size={}",
+                          fmt::ptr(indirect_buffer->Address<const u32>()),
+                          indirect_buffer->ib_size.Value());
+                break;
+            }
             auto task =
                 ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
             RESUME_CE(task);
@@ -238,15 +324,45 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
+        if (!Pm4PacketFits(dcb)) {
+            LOG_ERROR(Lib_GnmDriver,
+                      "PM4 packet exceeds remaining submission. type={} size={} remaining={}", type,
+                      Pm4PacketDwords(header->raw), dcb.size());
+            break;
+        }
 
         switch (type) {
         default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
+            LOG_ERROR(Lib_GnmDriver, "Wrong PM4 type {} — skipping remainder", type);
+            dcb = {};
             break;
-        case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+        case 0: {
+            const auto type0 = ConsumePm4Type0(dcb, regs.reg_array);
+            if (!type0.consumed) {
+                LOG_ERROR(Lib_GnmDriver,
+                          "PM4 type 0 exceeds remaining submission. base={} size={} remaining={}",
+                          header->type0.base.Value(), header->type0.NumWords(), dcb.size());
+                dcb = {};
+                break;
+            }
+            LOG_WARNING(Lib_GnmDriver, "PM4 type 0 register write base={} size={} written={}",
+                        header->type0.base.Value(), header->type0.NumWords(), type0.words_written);
+            dcb = NextPacket(dcb, type0.packet_dwords);
+            continue;
+        }
+        case 1: {
+            const auto type1 = ConsumePm4Type1(dcb, regs.reg_array);
+            if (!type1.consumed) {
+                LOG_ERROR(Lib_GnmDriver, "PM4 type 1 exceeds remaining submission. remaining={}",
+                          dcb.size());
+                dcb = {};
+                break;
+            }
+            LOG_WARNING(Lib_GnmDriver, "PM4 type 1 register write a={} b={} written={}",
+                        Pm4Type1RegA(header->raw), Pm4Type1RegB(header->raw), type1.words_written);
+            dcb = NextPacket(dcb, type1.packet_dwords);
+            continue;
+        }
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -254,6 +370,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+#ifdef ENABLE_BACHATA_RUNTIME
+            debug_last_opcode = static_cast<u32>(opcode);
+#endif
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -265,7 +384,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip,
+                                                       nop->data_block[1]);
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -691,9 +811,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
-                if (rasterizer) {
-                    rasterizer->ProcessDownloadImages();
-                }
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
                     if (!memory->TryWriteBacking(address, &data, num_bytes)) {
@@ -712,9 +829,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (rasterizer) {
-                    rasterizer->ProcessDownloadImages();
-                }
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
                         auto* memory = Core::Memory::Instance();
@@ -767,6 +881,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
                 if (!write_data->wr_one_addr.Value()) {
+                    MaybeRecordVideoOutLabelLock(vo_port, address, write_data->data, data_size);
                     std::memcpy(address, write_data->data, data_size);
                 } else {
                     UNREACHABLE();
@@ -788,7 +903,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    u64 sem_iters = 0;
                     while (!mem_semaphore->Signaled()) {
+#ifdef ENABLE_BACHATA_RUNTIME
+                        if (ShouldLogStallIteration(++sem_iters)) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "PM4 MEM_SEMAPHORE stalled queue=gfx iterations={}",
+                                        sem_iters);
+                        }
+#endif
                         YIELD_GFX();
                     }
                     mem_semaphore->Decrement();
@@ -804,7 +927,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                u64 rewind_iters = 0;
                 while (!rewind->Valid()) {
+#ifdef ENABLE_BACHATA_RUNTIME
+                    if (ShouldLogStallIteration(++rewind_iters)) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PM4 REWIND stalled queue=gfx iterations={}", rewind_iters);
+                    }
+#endif
                     YIELD_GFX();
                 }
                 break;
@@ -812,6 +942,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::WaitRegMem: {
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+                if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
+                    !Pm4GuestPointerUsable(wait_reg_mem->Address<const void*>())) {
+                    LOG_ERROR(Lib_GnmDriver, "IT_WAIT_REG_MEM null address — skipping");
+                    break;
+                }
                 // Optimization: VO label waits are special because the emulator
                 // will write to the label when presentation is finished. So if
                 // there are no other submits to yield to we can sleep the thread
@@ -819,23 +954,61 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    if (!wait_reg_mem->Test(regs.reg_array)) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "VO label wait addr={:#x} value={:#x} ref={:#x} index={}",
+                                    reinterpret_cast<uintptr_t>(wait_addr), *wait_addr,
+                                    wait_reg_mem->ref, vo_port->LabelIndex(wait_addr));
+                    }
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
+                u64 wait_iterations = 0;
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+#ifdef ENABLE_BACHATA_RUNTIME
+                    if (ShouldLogStallIteration(++wait_iterations)) {
+                        const bool is_memory = wait_reg_mem->mem_space.Value() ==
+                                               PM4CmdWaitRegMem::MemSpace::Memory;
+                        const u32 value = is_memory ? *wait_reg_mem->Address<const u32*>()
+                                                    : regs.reg_array[wait_reg_mem->Reg()];
+                        LOG_WARNING(Render_Vulkan,
+                                    "PM4 WAIT_REG_MEM stalled queue=gfx iterations={} space={} "
+                                    "address={:#x} value={:#x} ref={:#x} mask={:#x} function={}",
+                                    wait_iterations, is_memory ? "memory" : "register",
+                                    is_memory ? reinterpret_cast<uintptr_t>(
+                                                    wait_reg_mem->Address<const u32*>())
+                                              : wait_reg_mem->Reg(),
+                                    value, wait_reg_mem->ref, wait_reg_mem->mask,
+                                    static_cast<u32>(wait_reg_mem->function.Value()));
+                    }
+#endif
                     YIELD_GFX();
                 }
                 break;
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                if (!Pm4IndirectBufferUsable(indirect_buffer->Address<const u32>(),
+                                             indirect_buffer->ib_size)) {
+                    LOG_ERROR(Lib_GnmDriver, "IT_INDIRECT_BUFFER skipped: addr={} size={}",
+                              fmt::ptr(indirect_buffer->Address<const u32>()),
+                              indirect_buffer->ib_size.Value());
+                    break;
+                }
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 RESUME_GFX(task);
 
+                u64 ib_iters = 0;
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
+#ifdef ENABLE_BACHATA_RUNTIME
+                    if (ShouldLogStallIteration(++ib_iters)) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PM4 INDIRECT_BUFFER nested gfx stalled iterations={}", ib_iters);
+                    }
+#endif
                 }
                 break;
             }
@@ -844,8 +1017,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WaitOnCeCounter: {
+                u64 woce_iters = 0;
                 while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
                     RESUME_GFX(ce_task);
+#ifdef ENABLE_BACHATA_RUNTIME
+                    if (ShouldLogStallIteration(++woce_iters)) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PM4 WAIT_ON_CE_COUNTER stalled queue=gfx iterations={} "
+                                    "ce_count={} de_count={} ce_task_done={}",
+                                    woce_iters, cblock.ce_count, cblock.de_count, 0);
+                    }
+#endif
                 }
                 break;
             }
@@ -874,6 +1056,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
+                if (!Pm4GuestPointerUsable(cond_exec->Address())) {
+                    LOG_ERROR(Lib_GnmDriver, "IT_COND_EXEC null predicate — skipping remainder");
+                    dcb = {};
+                    break;
+                }
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
                     dcb = NextPacket(dcb,
@@ -892,8 +1079,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     if (ce_task.handle) {
+        u64 cedrain_iters = 0;
         while (!ce_task.handle.done()) {
             RESUME_GFX(ce_task);
+#ifdef ENABLE_BACHATA_RUNTIME
+            if (ShouldLogStallIteration(++cedrain_iters)) {
+                LOG_WARNING(Render_Vulkan,
+                            "PM4 CE_DRAIN stalled (post-dcb ce_task) iterations={} "
+                            "ce_count={} de_count={}",
+                            cedrain_iters, cblock.ce_count, cblock.de_count);
+            }
+#endif
         }
         ce_task.handle.destroy();
     }
@@ -919,12 +1115,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         ProcessCommands();
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
-        u32 next_dw_off = header->type3.NumWords() + 1;
+        // Type-1 REG_B lives in the type-3 count field. Size from type first.
+        u32 next_dw_off = header->type == 1 ? kPm4Type1PacketDwords : header->type3.NumWords() + 1;
 
         // If we have a buffered packet, use it.
         if (queue.tmp_dwords > 0) [[unlikely]] {
             header = reinterpret_cast<const PM4Header*>(queue.tmp_packet.data());
-            next_dw_off = header->type3.NumWords() + 1 - queue.tmp_dwords;
+            const u32 packet_dwords = header->type == 1 ? kPm4Type1PacketDwords
+                                                       : header->type3.NumWords() + 1;
+            next_dw_off = packet_dwords - queue.tmp_dwords;
             std::memcpy(queue.tmp_packet.data() + queue.tmp_dwords, acb.data(),
                         next_dw_off * sizeof(u32));
             queue.tmp_dwords = 0;
@@ -952,12 +1151,53 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             continue;
         }
 
+        if (header->type == 0) {
+            const auto type0 = ConsumePm4Type0(acb, regs.reg_array);
+            if (!type0.consumed) {
+                LOG_ERROR(Lib_GnmDriver,
+                          "ASC PM4 type 0 exceeds remaining submission. size={} remaining={}",
+                          header->type0.NumWords(), acb.size());
+                break;
+            }
+            LOG_WARNING(Lib_GnmDriver, "ASC PM4 type 0 register write base={} size={} written={}",
+                        header->type0.base.Value(), header->type0.NumWords(), type0.words_written);
+            next_dw_off = type0.packet_dwords;
+            acb = NextPacket(acb, next_dw_off);
+            if constexpr (!is_indirect) {
+                *queue.read_addr += next_dw_off;
+                *queue.read_addr %= queue.ring_size_dw;
+            }
+            continue;
+        }
+
+        if (header->type == 1) {
+            const auto type1 = ConsumePm4Type1(acb, regs.reg_array);
+            if (!type1.consumed) {
+                LOG_ERROR(Lib_GnmDriver,
+                          "ASC PM4 type 1 exceeds remaining submission. remaining={}", acb.size());
+                break;
+            }
+            LOG_WARNING(Lib_GnmDriver, "ASC PM4 type 1 register write a={} b={} written={}",
+                        Pm4Type1RegA(header->raw), Pm4Type1RegB(header->raw), type1.words_written);
+            next_dw_off = type1.packet_dwords;
+            acb = NextPacket(acb, next_dw_off);
+            if constexpr (!is_indirect) {
+                *queue.read_addr += next_dw_off;
+                *queue.read_addr %= queue.ring_size_dw;
+            }
+            continue;
+        }
+
         if (header->type != 3) {
-            // No other types of packets were spotted so far
-            UNREACHABLE_MSG("Invalid PM4 type {}", header->type.Value());
+            LOG_ERROR(Lib_GnmDriver, "ASC invalid PM4 type {} — skipping remainder",
+                      header->type.Value());
+            break;
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+#ifdef ENABLE_BACHATA_RUNTIME
+        debug_last_opcode = static_cast<u32>(opcode);
+#endif
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -967,6 +1207,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            if (!Pm4IndirectBufferUsable(indirect_buffer->Address<const u32>(),
+                                         indirect_buffer->ib_size)) {
+                LOG_ERROR(Lib_GnmDriver, "ASC IT_INDIRECT_BUFFER skipped: addr={} size={}",
+                          fmt::ptr(indirect_buffer->Address<const u32>()),
+                          indirect_buffer->ib_size.Value());
+                break;
+            }
             auto task = ProcessCompute<true>(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
             RESUME_ASC(task, vqid);
@@ -1115,6 +1362,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
+                MaybeRecordVideoOutLabelLock(vo_port, write_data->Address<u64*>(),
+                                             write_data->data, data_size);
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
                 UNREACHABLE();
@@ -1136,16 +1385,36 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
+                !Pm4GuestPointerUsable(wait_reg_mem->Address<const void*>())) {
+                LOG_ERROR(Lib_GnmDriver, "ASC IT_WAIT_REG_MEM null address — skipping");
+                break;
+            }
+            u64 wait_iterations = 0;
             while (!wait_reg_mem->Test(regs.reg_array)) {
+#ifdef ENABLE_BACHATA_RUNTIME
+                if (ShouldLogStallIteration(++wait_iterations)) {
+                    const bool is_memory = wait_reg_mem->mem_space.Value() ==
+                                           PM4CmdWaitRegMem::MemSpace::Memory;
+                    const u32 value = is_memory ? *wait_reg_mem->Address<const u32*>()
+                                                : regs.reg_array[wait_reg_mem->Reg()];
+                    LOG_WARNING(Render_Vulkan,
+                                "PM4 WAIT_REG_MEM stalled queue=asc{} iterations={} space={} "
+                                "address={:#x} value={:#x} ref={:#x} mask={:#x} function={}",
+                                vqid, wait_iterations, is_memory ? "memory" : "register",
+                                is_memory ? reinterpret_cast<uintptr_t>(
+                                                wait_reg_mem->Address<const u32*>())
+                                          : wait_reg_mem->Reg(),
+                                value, wait_reg_mem->ref, wait_reg_mem->mask,
+                                static_cast<u32>(wait_reg_mem->function.Value()));
+                }
+#endif
                 YIELD_ASC(vqid);
             }
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            if (rasterizer) {
-                rasterizer->ProcessDownloadImages();
-            }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
@@ -1177,10 +1446,29 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
 Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
-               "dcb copy buffer out of reserved space");
-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
-               "ccb copy buffer out of reserved space");
+
+    // A single submission must always fit the reserved copy space.
+    ASSERT_MSG(dcb.size() <= queue.dcb_buffer.capacity(),
+               "dcb submission larger than reserved copy space");
+    ASSERT_MSG(ccb.size() <= queue.ccb_buffer.capacity(),
+               "ccb submission larger than reserved copy space");
+
+    // The copy buffers persist across submissions so the GPU worker can parse a
+    // command buffer even after the guest reuses its source ring. Their offsets
+    // therefore grow monotonically and are only reset once the buffered data is no
+    // longer needed. The guest is expected to signal that point with
+    // sceGnmSubmitDone (-> SubmitDone), but some titles (e.g. Dark Souls
+    // Remastered) never call it, so the offset would otherwise overflow the
+    // reserved space and trip the assert below. When the next append would exceed
+    // the reservation, drain the GPU first (all previously buffered spans have
+    // then been consumed and can be discarded) and rewind the offsets to zero.
+    const bool dcb_overflows = queue.dcb_buffer_offset + dcb.size() > queue.dcb_buffer.capacity();
+    const bool ccb_overflows = queue.ccb_buffer_offset + ccb.size() > queue.ccb_buffer.capacity();
+    if (dcb_overflows || ccb_overflows) {
+        WaitGpuIdle();
+        queue.dcb_buffer_offset = 0;
+        queue.ccb_buffer_offset = 0;
+    }
 
     queue.dcb_buffer.resize(
         std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));

@@ -8,6 +8,7 @@
 namespace Shader {
 
 struct Profile {
+    u64 max_ubo_size{};
     u32 max_viewport_width{};
     u32 max_viewport_height{};
     u32 max_shared_memory_size{};
@@ -32,6 +33,7 @@ struct Profile {
     bool support_fp16_signed_zero_inf_nan_preserve{};
     bool support_fp32_signed_zero_inf_nan_preserve{};
     bool support_fp64_signed_zero_inf_nan_preserve{};
+    bool support_legacy_vertex_attributes{};
     bool supports_image_load_store_lod{};
     bool supports_native_cube_calc{};
     bool supports_trinary_minmax{};
@@ -49,9 +51,12 @@ struct Profile {
     bool needs_buffer_offsets{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
+    bool needs_bit_preserving_buffer0_loads{};
     bool supports_shader_stencil_export{};
-
-    bool operator==(const Profile&) const = default;
+    bool supports_shader_cull_distance{true};
+    u32 max_clip_distances{8};
+    u32 max_cull_distances{8};
+    u32 max_combined_clip_and_cull_distances{8};
 };
 
 } // namespace Shader

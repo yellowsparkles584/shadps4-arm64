@@ -410,7 +410,6 @@ public:
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
-        std::unique_lock lk(pending_ops_mutex);
         pending_ops.emplace(std::move(func), CurrentTick());
     }
 
@@ -445,7 +444,6 @@ private:
         u64 gpu_tick;
     };
     std::queue<PendingOp> pending_ops;
-    std::recursive_mutex pending_ops_mutex;
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;

@@ -62,14 +62,8 @@ public:
     void SetScalarReg(IR::ScalarReg reg, const U32F32& value);
     void SetVectorReg(IR::VectorReg reg, const U32F32& value);
 
-    [[nodiscard]] Value GetVirtualReg(IR::VirtualReg reg);
-    void SetVirtualReg(IR::VirtualReg reg, const Value& value);
-
     [[nodiscard]] U1 GetGotoVariable(u32 id);
     void SetGotoVariable(u32 id, const U1& value);
-
-    [[nodiscard]] U1 GetMaskLaneVariable(IR::VectorReg vgpr, u32 lane);
-    void SetMaskLaneVariable(IR::VectorReg vgpr, u32 lane, const U1& value);
 
     [[nodiscard]] U1 GetScc();
     [[nodiscard]] U1 GetExec();

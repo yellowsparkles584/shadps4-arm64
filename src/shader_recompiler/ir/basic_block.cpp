@@ -92,8 +92,6 @@ static std::string ArgToIndex(std::map<const Inst*, size_t>& inst_to_index, size
         return fmt::format("{}", arg.ScalarReg());
     case Type::VectorReg:
         return fmt::format("{}", arg.VectorReg());
-    case Type::VirtualReg:
-        return fmt::format("{}", arg.VirtualReg());
     case Type::Attribute:
         return fmt::format("{}", arg.Attribute());
     case Type::Patch:
@@ -115,17 +113,7 @@ std::string DumpBlock(const Block& block, const std::map<const Block*, size_t>& 
     if (const auto it{block_to_index.find(&block)}; it != block_to_index.end()) {
         ret += fmt::format(" ${}", it->second);
     }
-    ret += " predecessors [";
-    for (auto* block : block.ImmPredecessors()) {
-        const auto it{block_to_index.find(block)};
-        ASSERT(it != block_to_index.end());
-        ret += fmt::format("${}, ", it->second);
-    }
-    if (!block.ImmPredecessors().empty()) {
-        ret.pop_back();
-        ret.pop_back();
-    }
-    ret += "]\n";
+    ret += '\n';
     for (const Inst& inst : block) {
         const Opcode op{inst.GetOpcode()};
         ret += fmt::format("[{:016x}] ", reinterpret_cast<u64>(&inst));

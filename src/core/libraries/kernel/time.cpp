@@ -31,25 +31,27 @@ namespace Libraries::Kernel {
 static u64 initial_ptc;
 static std::unique_ptr<Common::NativeClock> clock;
 
+// Host-side threads (e.g. the Bachata input reader) can query process time before
+// RegisterTime runs during InitHLELibs; report 0/1 Hz rather than dereferencing null.
 u64 PS4_SYSV_ABI sceKernelGetTscFrequency() {
-    return clock->GetTscFrequency();
+    return clock ? clock->GetTscFrequency() : 0;
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTime() {
     // TODO: this timer should support suspends, so initial ptc needs to be updated on wake up
-    return clock->GetTimeUS(initial_ptc);
+    return clock ? clock->GetTimeUS(initial_ptc) : 0;
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() {
-    return clock->GetUptime() - initial_ptc;
+    return clock ? clock->GetUptime() - initial_ptc : 0;
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
-    return clock->GetTscFrequency();
+    return clock ? clock->GetTscFrequency() : 1;
 }
 
 u64 PS4_SYSV_ABI sceKernelReadTsc() {
-    return clock->GetUptime();
+    return clock ? clock->GetUptime() : 0;
 }
 
 static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp,

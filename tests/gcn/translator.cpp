@@ -24,25 +24,17 @@ void ResourceTrackingPassStub(IR::Program& program, const Profile& profile);
 }
 
 std::vector<u32> TranslateToSpirv(u64 raw_gcn_inst) {
-    return TranslateToSpirv(std::span<const u64>{&raw_gcn_inst, 1});
-}
-
-std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts) {
+    std::array<u32, 2> provided_inst{static_cast<u32>(raw_gcn_inst & 0xFFFFFFFFU),
+                                     static_cast<u32>(raw_gcn_inst >> 32)};
     std::array<u32, 2> store{
         0xe0700000,
         0x80000000 // buffer_store_dword v0, v0, s[0:3], 0
     };
+    Gcn::GcnCodeSlice first(provided_inst.data(), provided_inst.data() + provided_inst.size());
     Gcn::GcnCodeSlice second(store.data(), store.data() + store.size());
 
     Gcn::GcnDecodeContext decoder;
-    std::vector<Gcn::GcnInst> instructions;
-    instructions.reserve(raw_gcn_insts.size());
-    for (const u64 raw_gcn_inst : raw_gcn_insts) {
-        std::array<u32, 2> provided_inst{static_cast<u32>(raw_gcn_inst & 0xFFFFFFFFU),
-                                         static_cast<u32>(raw_gcn_inst >> 32)};
-        Gcn::GcnCodeSlice slice(provided_inst.data(), provided_inst.data() + provided_inst.size());
-        instructions.push_back(decoder.decodeInstruction(slice));
-    }
+    Gcn::GcnInst inst = decoder.decodeInstruction(first);
     Gcn::GcnInst store_inst = decoder.decodeInstruction(second);
 
     Shader::Info info{};
@@ -87,12 +79,10 @@ std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts) {
         mov.dst[0].code = i;
         translator.S_MOV(mov);
     }
-    for (const Gcn::GcnInst& inst : instructions) {
-        translator.TranslateInstruction(inst);
-    }
+    translator.TranslateInstruction(inst);
     translator.TranslateInstruction(store_inst);
 
-    Shader::Optimization::SsaRewritePass(program);
+    Shader::Optimization::SsaRewritePass(program.post_order_blocks);
     Shader::Optimization::IdentityRemovalPass(program.blocks);
     Shader::Optimization::ResourceTrackingPassStub(program, profile);
     Shader::Optimization::ConstantPropagationPass(program.blocks);

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
@@ -67,6 +67,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     const auto config_path = GetUserPath(Common::FS::PathType::UserDir) / "imgui.ini";
     const auto log_path = GetUserPath(Common::FS::PathType::LogDir) / "imgui_log.txt";
 
+    std::fprintf(stderr, "BACHATA_IMGUI_CTX\n");
     CreateContext();
     ImGuiIO& io = GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -103,13 +104,17 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     FontStack::AddPrimaryUiFont(ImGui::GetIO().Fonts, 64.0f, EmulatorSettings.GetConsoleLanguage(),
                                 font_cfg, true);
 
+    std::fprintf(stderr, "BACHATA_IMGUI_FONTS_BUILD\n");
     io.Fonts->Build();
+    std::fprintf(stderr, "BACHATA_IMGUI_FONTS_READY\n");
 
     io.FontGlobalScale = 0.5f;
 
     StyleColorsDark();
 
+    std::fprintf(stderr, "BACHATA_IMGUI_DEVTOOLS\n");
     ::Core::Devtools::Layer::SetupSettings();
+    std::fprintf(stderr, "BACHATA_IMGUI_SDL\n");
     Sdl::Init(window.GetSDLWindow());
 
     const Vulkan::InitInfo vk_info{
@@ -127,9 +132,13 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
         .allocator = allocator,
         .check_vk_result_fn = &CheckVkResult,
     };
+    std::fprintf(stderr, "BACHATA_IMGUI_VK\n");
     Vulkan::Init(vk_info);
+    std::fprintf(stderr, "BACHATA_IMGUI_VK_READY\n");
 
+    std::fprintf(stderr, "BACHATA_IMGUI_TEX\n");
     TextureManager::StartWorker();
+    std::fprintf(stderr, "BACHATA_IMGUI_TEX_READY\n");
 
     char label[32];
     ImFormatString(label, IM_ARRAYSIZE(label), "WindowOverViewport_%08X", GetMainViewport()->ID);
@@ -285,8 +294,7 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
 }
 
 bool MustKeepDrawing() {
-    return std::ranges::any_of(layers, [](Layer* layer) { return layer->ShouldKeepDrawing(); }) ||
-           change_layers.size() > 1;
+    return layers.size() > 1 || change_layers.size() > 1 || DebugState.IsShowingDebugMenuBar();
 }
 
 } // namespace Core

@@ -92,6 +92,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Run FEXCore source regression tests
+        run: node --test runtime/tests/fexcore-*-source.test.mjs
+        shell: bash
+
       - name: Setup CMake
         uses: lukka/get-cmake@latest
 

@@ -3,10 +3,8 @@
 
 #pragma once
 
-#include <span>
 #include <vector>
 
 #include "common/types.h"
 
 std::vector<u32> TranslateToSpirv(u64 raw_gcn_inst);
-std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts);

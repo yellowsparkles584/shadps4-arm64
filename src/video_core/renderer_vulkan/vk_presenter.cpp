@@ -10,15 +10,14 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/system/systemservice.h"
-#include "imgui/friends_layer.h"
-#include "imgui/invitation_prompt_layer.h"
 #include "imgui/notifications_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "imgui/renderer/imgui_impl_vulkan.h"
-#include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/stall_log.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -34,7 +33,6 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -43,7 +41,7 @@
 #include <system_error>
 #include <vector>
 #include <imgui.h>
-#include <stb_image_write.h>
+#include <png.h>
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
@@ -407,11 +405,36 @@ static bool WritePng(const std::filesystem::path& path, const std::span<const u8
         return false;
     }
 
-    auto callback = [](void* context, void* data, int size) {
-        const auto* f = static_cast<Common::FS::IOFile*>(context);
-        f->WriteRaw<u8>(data, size);
-    };
-    return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (png_ptr == nullptr) {
+        return false;
+    }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (info_ptr == nullptr) {
+        png_destroy_write_struct(&png_ptr, nullptr);
+        return false;
+    }
+
+    if (setjmp(png_jmpbuf(png_ptr)) != 0) {
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+        return false;
+    }
+
+    png_init_io(png_ptr, file.file);
+    png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+
+    thread_local std::vector<png_bytep> rows;
+    rows.resize(height);
+    for (u32 y = 0; y < height; ++y) {
+        rows[y] = const_cast<png_bytep>(rgba.data() + static_cast<size_t>(y) * width * 4);
+    }
+
+    png_write_image(png_ptr, rows.data());
+    png_write_end(png_ptr, info_ptr);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    return true;
 }
 
 static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readbacks) {
@@ -495,19 +518,15 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_settings.rcas_attenuation =
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
-    fsr_pass.Create(device, instance.GetAllocator(), num_images);
-    pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    fsr_pass.Create(instance, draw_scheduler.GetMasterSemaphore(), device,
+                    instance.GetAllocator(), num_images);
+    pp_pass.Create(instance, draw_scheduler.GetMasterSemaphore(),
+                   swapchain.GetSurfaceFormat().format);
 
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
-    ImGui::Friends::Register();
-    ImGui::ShadNetNotify::Register();
-    ImGui::InvitationPrompt::Register();
 }
 
 Presenter::~Presenter() {
-    ImGui::InvitationPrompt::Unregister();
-    ImGui::ShadNetNotify::Unregister();
-    ImGui::Friends::Unregister();
     ImGui::Layer::RemoveLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
 
     draw_scheduler.Finish();
@@ -613,8 +632,15 @@ Frame* Presenter::PrepareLastFrame() {
         if (result == vk::Result::eTimeout) {
             continue;
         }
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
+        if (result == vk::Result::eErrorDeviceLost) {
+            // Soft-fail: hard ASSERT became exit 133 on Mali after first game frame.
+            // Returning the frame lets Present discover device-lost on acquire/present.
+            LOG_CRITICAL(Render_Vulkan, "Device lost during waiting for a frame (PrepareLastFrame)");
+            break;
+        }
+        LOG_ERROR(Render_Vulkan, "Unexpected waitForFences result in PrepareLastFrame: {}",
+                  vk::to_string(result));
+        break;
     }
 
     auto& scheduler = flip_scheduler;
@@ -653,6 +679,18 @@ Frame* Presenter::PrepareLastFrame() {
 }
 
 static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat format) {
+#ifdef ENABLE_BACHATA_RUNTIME
+    // The embedded X11 server's DRI3 path exposes the guest frame with the opposite R/B
+    // memory order from desktop WSI. Compensate in the sampled image view.
+    switch (format) {
+    case Libraries::VideoOut::PixelFormat::A8B8G8R8Srgb:
+        return vk::Format::eB8G8R8A8Srgb;
+    case Libraries::VideoOut::PixelFormat::A8R8G8B8Srgb:
+        return vk::Format::eR8G8B8A8Srgb;
+    default:
+        break;
+    }
+#endif
     switch (format) {
     case Libraries::VideoOut::PixelFormat::A8B8G8R8Srgb:
         return vk::Format::eR8G8B8A8Srgb;
@@ -676,6 +714,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     texture_cache.UpdateImage(image_id);
 
     Frame* frame = GetRenderFrame();
+    if (!frame) {
+        return nullptr;
+    }
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -762,6 +803,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
+    if (!frame) {
+        return nullptr;
+    }
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
@@ -833,6 +877,34 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+    static std::atomic_uint32_t present_traces{};
+    const u32 trace_id = present_traces.fetch_add(1, std::memory_order_relaxed);
+
+    // Bachata diagnostics: dump the guest output buffer every N presents when
+    // the file <UserDir>/auto_shot_every exists (device black-screen triage;
+    // env vars cannot be injected into the app-spawned runtime).
+    static const u32 shot_every = [] {
+        std::error_code ec;
+        const auto shot_flag =
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "auto_shot_every";
+        if (std::filesystem::exists(shot_flag, ec)) {
+            Common::FS::IOFile f(shot_flag, Common::FS::FileAccessMode::Read);
+            std::array<char, 16> buf{};
+            const auto n = f.ReadRaw<char>(buf.data(), buf.size() - 1);
+            buf[n] = '\0';
+            const u32 v = std::strtoul(buf.data(), nullptr, 10);
+            LOG_INFO(Render_Vulkan, "BACHATA_AUTO_SHOT every={} presents", v);
+            return v;
+        }
+        return 0u;
+    }();
+    if (shot_every > 0 && trace_id > 0 && trace_id % shot_every == 0) {
+        VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+        VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::WithOverlays);
+    }
+    // Log first 64, then every 16th, always around suspected 32-present boundary.
+    const bool trace = trace_id < 64 || (trace_id % 16u) == 0u ||
+                       (trace_id >= 28 && trace_id <= 40);
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -857,11 +929,31 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
             return;
         }
     }
+    if (trace) {
+        LOG_INFO(Render_Vulkan, "BACHATA_PRESENT_TRACE id={} stage=acquire_done", trace_id);
+        LOG_INFO(Render_Vulkan,
+                 "FRAME_SLOT_ACQUIRE presentId={} slot={} frameW={} frameH={} "
+                 "swapchainFrameIndex={} swapchainImageCount={} readyTick={}",
+                 trace_id, frame ? int(frame->id) : -1, frame ? frame->width : 0,
+                 frame ? frame->height : 0, swapchain.GetFrameIndex(), swapchain.GetImageCount(),
+                 frame ? frame->ready_tick : 0);
+    }
 
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
     // the frame's present fence and future GetRenderFrame() call will hang waiting for this frame.
     const auto reset_result = instance.GetDevice().resetFences(frame->present_done);
+    if (reset_result == vk::Result::eErrorDeviceLost) {
+        LOG_CRITICAL(Render_Vulkan, "Device lost while resetting present done fence");
+        static std::atomic<bool> device_lost_snapshot_logged{false};
+        if (!device_lost_snapshot_logged.exchange(true)) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "DEVICE_LOST_SNAPSHOT where=resetPresentFence presentId={} slot={}",
+                         trace_id, frame ? int(frame->id) : -1);
+        }
+        free_frame();
+        return;
+    }
     ASSERT_MSG(reset_result == vk::Result::eSuccess,
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
 
@@ -945,9 +1037,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
                 if (Libraries::SystemService::IsSplashVisible()) { // draw splash
                     if (!splash_img.has_value()) {
                         splash_img.emplace();
-                        const auto& splash_data = Common::ElfInfo::Instance().GetSplashData();
-                        if (!splash_data.empty()) {
-                            splash_img = ImGui::RefCountedTexture::DecodePngTexture(splash_data);
+                        auto splash_path = Common::ElfInfo::Instance().GetSplashPath();
+                        if (!splash_path.empty()) {
+                            splash_img = ImGui::RefCountedTexture::DecodePngFile(splash_path);
                         }
                     }
                     if (auto& splash_image = this->splash_img.value()) {
@@ -1069,11 +1161,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
+    if (trace) {
+        LOG_INFO(Render_Vulkan, "BACHATA_PRESENT_TRACE id={} stage=flush_done", trace_id);
+    }
 
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        const bool presented = swapchain.Present();
+        if (trace) {
+            LOG_INFO(Render_Vulkan, "BACHATA_PRESENT_TRACE id={} stage=present_done ok={}", trace_id,
+                     presented);
+        }
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
@@ -1087,9 +1187,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
 Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;
+    const bool nonblock =
+        liverpool && liverpool->IsGpuThread() && liverpool->InGfxTask();
     {
         std::unique_lock lock{free_mutex};
-        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        if (nonblock) {
+            if (free_queue.empty()) {
+                return nullptr;
+            }
+        } else {
+            free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        }
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -1100,19 +1208,62 @@ Frame* Presenter::GetRenderFrame() {
     const vk::Device device = instance.GetDevice();
     vk::Result result{};
 
+    static std::atomic_uint32_t get_frame_traces{};
+    const u32 get_id = get_frame_traces.fetch_add(1, std::memory_order_relaxed);
+    if (get_id < 64 || (get_id % 16u) == 0u || (get_id >= 28 && get_id <= 40)) {
+        LOG_INFO(Render_Vulkan,
+                 "GET_RENDER_FRAME_WAIT frameGetId={} slot={} poolSize={} freeRemaining={} "
+                 "readyTick={} (before waitForFences)",
+                 get_id, frame ? int(frame->id) : -1, present_frames.size(), free_queue.size(),
+                 frame ? frame->ready_tick : 0);
+    }
+
+    const u64 timeout_ns = AmdGpu::PresentFenceTimeoutNs(
+        liverpool && liverpool->IsGpuThread(), liverpool && liverpool->InGfxTask());
     const auto wait = [&]() {
-        result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
+        result = device.waitForFences(frame->present_done, false, timeout_ns);
         return result;
     };
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
-        // Retry if the waiting times out
         if (result == vk::Result::eTimeout) {
+            if (nonblock) {
+                static std::atomic<u32> defer_count{};
+                if (defer_count.fetch_add(1, std::memory_order_relaxed) % 100 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "GetRenderFrame: present fence busy on GpuComm; deferring flip");
+                }
+                std::scoped_lock relock{free_mutex};
+                free_queue.push(frame);
+                free_cv.notify_one();
+                return nullptr;
+            }
             continue;
         }
+        if (result == vk::Result::eErrorDeviceLost) {
+            // Soft-fail on Mali/Vortek: ASSERT_MSG here was exit 133 after the first
+            // real EOP flip. Return the frame so Present can soft-fail acquire/present
+            // and the session can stop without an immediate trap.
+            // Client-side snapshot header; server dumps live alloc map via
+            // DEVICE_LOST_SNAPSHOT in libbachata_vortek_server (logcat Bachata.Vortek.GpuTrack).
+            static std::atomic<bool> device_lost_snapshot_logged{false};
+            const u32 flip_num = DebugState.GetFrameNum();
+            LOG_CRITICAL(Render_Vulkan, "Device lost during waiting for a frame (GetRenderFrame)");
+            if (!device_lost_snapshot_logged.exchange(true)) {
+                LOG_CRITICAL(Render_Vulkan,
+                             "DEVICE_LOST_SNAPSHOT where=GetRenderFrame lastPresent={} "
+                             "currentFrameId={} frameSize={}x{} hdr={} "
+                             "flipFrameNum={} (server alloc dump in logcat tag "
+                             "Bachata.Vortek.GpuTrack)",
+                             flip_num, frame ? int(frame->id) : -1, frame ? frame->width : 0,
+                             frame ? frame->height : 0, frame && frame->is_hdr ? 1 : 0, flip_num);
+            }
+            break;
+        }
+        LOG_ERROR(Render_Vulkan, "Unexpected waitForFences result in GetRenderFrame: {}",
+                  vk::to_string(result));
+        break;
     }
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||

@@ -66,12 +66,6 @@ jobs:
       - name: Build Vortek client (aarch64-glibc libvulkan_vortek.so)
         run: runtime/scripts/build-vortek-client.sh
 
-      - name: Build shadPS4 x86_64 (stub, FAST_FDROID_BUILD)
-        run: FAST_FDROID_BUILD=1 runtime/scripts/build-shadps4-x86_64.sh
-
-      - name: Build box64 host (glibc aarch64)
-        run: runtime/scripts/build-box64-host.sh
-
       - name: Build FEXCore + shadPS4 arm64
         run: |
           df -h /

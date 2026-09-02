@@ -14,8 +14,6 @@
 #endif
 
 void assert_fail_impl() {
-    Common::Singleton<Core::Emulator>::Instance()->Shutdown();
-    Crash();
 }
 
 [[noreturn]] void unreachable_impl() {
